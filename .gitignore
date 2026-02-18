@@ -1,2 +1,8 @@
 data/
 ebm_genkg/experiments/
+ebm_genkg/checkpoints/
+ebm_genkg/tmp/
+code/model/output/
+code/model/log/
+code/model/dataset/
+data/
