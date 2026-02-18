@@ -1,0 +1,16 @@
+# Example usage:
+# python scripts/sweep_pipeline.py \
+#   --infer_config configs/infer_ebm.yaml \
+#   --eval_config configs/eval.yaml \
+#   --out_dir experiments/sweeps/sweep_debug \
+#   --limit_scenes 10 \
+#   --keep_thrs 0.40,0.50 \
+#   --fill_keep_thrs 0.30,0.35,0.40 \
+#   --nms_thrs 1.0,1.5 \
+#   --topks 200 \
+#   --min_dt_supports 1,2,3 \
+#   --max_fills 180,220,300 \
+#   --prefilter_seed 400,500 \
+#   --prefilter_fill 600,700
+
+# This file is documentation-only for now; sweep_pipeline.py uses CLI args directly.

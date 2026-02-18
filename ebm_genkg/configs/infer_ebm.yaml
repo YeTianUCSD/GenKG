@@ -1,0 +1,54 @@
+# run with:
+# python scripts/run_infer.py --config configs/infer_ebm.yaml
+
+in_json: /home/code/3Ddetection/IS-Fusion/GenKG/code/model/dataset/sorted_by_scene_ISFUSIONandGTattr_val.json
+out_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/out_refined.json
+
+# null = full dataset; set integer (e.g., 10) for quick debug
+limit_scenes: null
+log_every_scenes: 10
+require_gt: false
+
+# candidate building
+use_warp: true
+warp_radius: 2
+warp_topk: 120
+warp_decay: 0.9
+raw_score_min: 0.05
+max_per_frame: 180
+ignore_classes: "-1"
+
+# inference backend
+backend: ebm
+use_sources: all
+keep_thr: 0.50
+nms_thr: 1.5
+topk: 200
+include_sources: false
+
+# two-stage fill
+two_stage: true
+seed_keep_thr: 0.50
+seed_sources: raw
+fill_keep_thr: 0.35
+min_dt_support: 2
+dt_cell_size: 1.0
+min_dist_to_seed: 0.8
+max_fill: 220
+
+# ebm runtime kwargs
+ebm_prefilter_topm_seed: 500
+ebm_prefilter_topm_fill: 700
+ebm_enable_label_vote: false
+ebm_w_attr: 0.0
+ebm_unary_use_learned: true
+ebm_unary_ckpt_path: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/train_20260211-084007/checkpoints/unary_logreg.json
+
+# writeback
+write_mode: add
+det_key: det
+refined_key: det_refined
+write_fields: boxes_3d,labels_3d,scores_3d,attrs
+indent: 2
+
+dump_repl_map: null

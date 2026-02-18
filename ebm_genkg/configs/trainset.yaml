@@ -1,0 +1,26 @@
+# run with:
+# python scripts/build_trainset.py --config configs/trainset.yaml
+
+in_json: /home/code/3Ddetection/IS-Fusion/GenKG/code/model/dataset/sorted_by_scene_ISFUSIONres_GT_attributions_train.json
+out_npz: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset.npz
+out_meta: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset.meta.json
+
+# null = full dataset; set integer for quick iteration
+limit_scenes: null
+require_gt: true
+
+# training targets built from: all candidates (raw + warp) or raw-only
+target_candidates: all
+match_thr: 2.0
+ignore_classes: "-1"
+
+# candidate generation
+use_warp: true
+warp_radius: 2
+warp_topk: 120
+warp_decay: 0.9
+raw_score_min: 0.05
+max_per_frame: 180
+
+# feature engineering
+support_cell: 1.0

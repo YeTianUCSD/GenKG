@@ -1,0 +1,21 @@
+# run with:
+# python scripts/run_eval.py --config configs/eval.yaml
+
+in_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/out_refined.json
+
+# null = full dataset; set integer (e.g., 10) for quick debug
+limit_scenes: null
+require_gt: true
+
+# evaluate both raw and refined with unified metrics.py
+eval_raw: true
+eval_refined: true
+print_delta: true
+
+# comma-separated thresholds in meters
+match_thrs: "2.0"
+ignore_classes: "-1"
+
+# attr fields (optional)
+raw_attr_field: null
+refined_attr_field: attrs
