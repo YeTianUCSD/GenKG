@@ -6,3 +6,5 @@ code/model/output/
 code/model/log/
 code/model/dataset/
 data/
+__pycache__/
+*.pyc

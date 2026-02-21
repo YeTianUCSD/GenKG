@@ -100,6 +100,39 @@ def _dist2_xy(a_xy: Tuple[float, float], b_xy: Tuple[float, float]) -> float:
     return dx * dx + dy * dy
 
 
+def _bev_overlap_ratio_min(ci: Candidate, cj: Candidate) -> float:
+    """
+    Approximate BEV overlap ratio: inter_area / min(area_i, area_j).
+    Uses axis-aligned boxes from (x,y,dx,dy) for speed.
+    """
+    bi = np.asarray(ci.box, dtype=np.float32)
+    bj = np.asarray(cj.box, dtype=np.float32)
+    if bi.shape[0] < 5 or bj.shape[0] < 5:
+        return 0.0
+
+    xi, yi = float(bi[0]), float(bi[1])
+    xj, yj = float(bj[0]), float(bj[1])
+    dxi, dyi = abs(float(bi[3])), abs(float(bi[4]))
+    dxj, dyj = abs(float(bj[3])), abs(float(bj[4]))
+    if dxi <= 1e-6 or dyi <= 1e-6 or dxj <= 1e-6 or dyj <= 1e-6:
+        return 0.0
+
+    li, ri = xi - 0.5 * dxi, xi + 0.5 * dxi
+    biy, tiy = yi - 0.5 * dyi, yi + 0.5 * dyi
+    lj, rj = xj - 0.5 * dxj, xj + 0.5 * dxj
+    bjy, tjy = yj - 0.5 * dyj, yj + 0.5 * dyj
+
+    iw = max(0.0, min(ri, rj) - max(li, lj))
+    ih = max(0.0, min(tiy, tjy) - max(biy, bjy))
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+
+    ai = dxi * dyi
+    aj = dxj * dyj
+    return float(inter / max(min(ai, aj), 1e-6))
+
+
 # -----------------------------------------------------------------------------
 # Configs
 # -----------------------------------------------------------------------------
@@ -125,6 +158,13 @@ class AttrConfig:
 
 @dataclass
 class EBMConfig:
+    # model mode
+    energy_mode: str = "four_term"  # "four_term" | "legacy"
+    energy_select_margin: float = 0.0
+    energy_prob_gate: float = 0.0
+    energy_local_refine: bool = True
+    energy_local_refine_rounds: int = 2
+
     # candidate eligibility
     use_sources: str = "all"  # "raw" or "all"
     raw_only_score_min: float = 0.0
@@ -157,8 +197,17 @@ class EBMConfig:
     # pairwise (NMS-like)
     nms_thr_xy: float = 1.0
     nms_cross_class: bool = False
-    hard_nms: bool = True
+    hard_nms: bool = False
     soft_pair_scale: float = 5.0
+    # overlap soft penalty in BEV
+    enable_overlap_soft: bool = True
+    overlap_min_ratio: float = 0.10
+    overlap_soft_scale: float = 1.00
+    # temporal pair bonus (negative energy)
+    enable_temporal_pair: bool = True
+    temporal_pair_radius: float = 1.5
+    temporal_pair_bonus: float = 0.30
+    temporal_pair_warp_only: bool = True
 
     # optional per-class cap
     max_per_class: Optional[int] = None
@@ -172,6 +221,17 @@ class EBMConfig:
     dt_cell_size: float = 1.0      # alias to support_cell_xy
     min_dist_to_seed: float = 0.8
     max_fill: int = 300
+    # Soft relation-energy for dt support shortfall in fill stage.
+    # When enabled, candidates below min_dt_support are not hard-filtered;
+    # they get an added positive energy penalty.
+    soft_dt_support: bool = True
+    dt_shortfall_penalty: float = 0.35
+    # context-density energy
+    enable_context_density: bool = True
+    context_cell_xy: float = 1.0
+    context_min_density: int = 2
+    context_shortfall_penalty: float = 0.15
+    context_warp_only: bool = True
 
     # IMPORTANT speed-up: keep only top-M by keep_logit in each stage pool
     prefilter_topm_seed: int = 1500
@@ -180,6 +240,7 @@ class EBMConfig:
     # learned unary model (optional)
     unary_use_learned: bool = True
     unary_ckpt_path: Optional[str] = None
+    enable_learned_pair: bool = True
 
     # label vote refinement
     enable_label_vote: bool = False
@@ -222,25 +283,65 @@ class _UnaryLinearModel:
         self.model_type = str(ckpt.get("model_type", ""))
         self.feature_names = [str(x) for x in ckpt.get("feature_names", [])]
         self.normalize = bool(ckpt.get("normalize", False))
+        self.is_structured = self.model_type == "structured_energy_mlp"
 
         self.mu = np.asarray(ckpt.get("mu", []), dtype=np.float64).reshape(-1)
         self.std = np.asarray(ckpt.get("std", []), dtype=np.float64).reshape(-1)
         self.w = np.asarray(ckpt.get("weights", []), dtype=np.float64).reshape(-1)
         self.b = float(ckpt.get("bias", 0.0))
+        rel = ckpt.get("relation", {}) if isinstance(ckpt.get("relation", {}), dict) else {}
+        self.rel_enabled = bool(rel.get("enabled", False))
+        self.rel_feature_names = [str(x) for x in rel.get("feature_names", [])]
+        self.rel_w = np.asarray(rel.get("weights", []), dtype=np.float64).reshape(-1)
+        self.rel_b = float(rel.get("bias", 0.0))
+        self._feat_idx = {n: i for i, n in enumerate(self.feature_names)}
 
-        if self.model_type != "logistic_unary":
+        # Structured energy unary MLP
+        mlp = ckpt.get("unary_mlp", {}) if isinstance(ckpt.get("unary_mlp", {}), dict) else {}
+        self.mlp_w1 = np.asarray(mlp.get("w1", []), dtype=np.float64)
+        self.mlp_b1 = np.asarray(mlp.get("b1", []), dtype=np.float64).reshape(-1)
+        self.mlp_w2 = np.asarray(mlp.get("w2", []), dtype=np.float64).reshape(-1)
+        self.mlp_b2 = float(mlp.get("b2", 0.0))
+
+        # Structured learned pair energy
+        pair = ckpt.get("pair", {}) if isinstance(ckpt.get("pair", {}), dict) else {}
+        self.pair_enabled = bool(pair.get("enabled", False))
+        self.pair_feature_names = [str(x) for x in pair.get("feature_names", [])]
+        self.pair_w = np.asarray(pair.get("weights", []), dtype=np.float64).reshape(-1)
+        self.pair_b = float(pair.get("bias", 0.0))
+        self.pair_scale = float(pair.get("scale", 1.0))
+        self.pair_radius = float(pair.get("radius", 2.5))
+
+        if self.model_type not in ("logistic_unary", "logistic_energy", "structured_energy_mlp"):
             raise ValueError(f"Unsupported unary model_type: {self.model_type}")
-        if len(self.feature_names) != self.w.shape[0]:
-            raise ValueError("feature_names and weights length mismatch in unary checkpoint")
+        if self.is_structured:
+            if self.mlp_w1.ndim != 2:
+                raise ValueError("structured unary_mlp.w1 must be 2D")
+            if self.mlp_w1.shape[0] != len(self.feature_names):
+                raise ValueError("structured unary_mlp.w1 input dim mismatch feature_names")
+            if self.mlp_b1.shape[0] != self.mlp_w1.shape[1]:
+                raise ValueError("structured unary_mlp.b1 hidden dim mismatch")
+            if self.mlp_w2.shape[0] != self.mlp_w1.shape[1]:
+                raise ValueError("structured unary_mlp.w2 hidden dim mismatch")
+        else:
+            if len(self.feature_names) != self.w.shape[0]:
+                raise ValueError("feature_names and weights length mismatch in unary checkpoint")
         if self.normalize:
-            if self.mu.shape[0] != self.w.shape[0] or self.std.shape[0] != self.w.shape[0]:
+            dim = len(self.feature_names)
+            if self.mu.shape[0] != dim or self.std.shape[0] != dim:
                 raise ValueError("mu/std length mismatch in unary checkpoint")
+        if self.rel_enabled and len(self.rel_feature_names) != self.rel_w.shape[0]:
+            raise ValueError("relation feature_names and weights length mismatch in unary checkpoint")
+        if self.pair_enabled and len(self.pair_feature_names) != self.pair_w.shape[0]:
+            raise ValueError("pair feature_names and weights length mismatch in checkpoint")
 
     def _feature_dict(
         self,
         c: Candidate,
         support_count: int,
         support_unique_dt: int,
+        temporal_stability: float,
+        local_density: int,
     ) -> Dict[str, float]:
         b = np.asarray(c.box, dtype=np.float32)
         if b.shape[0] < 9:
@@ -287,6 +388,8 @@ class _UnaryLinearModel:
             "vy": vy,
             "support_count": float(support_count),
             "support_unique_dt": float(support_unique_dt),
+            "temporal_stability": float(temporal_stability),
+            "local_density": float(local_density),
         }
 
     def predict_logits(
@@ -294,24 +397,82 @@ class _UnaryLinearModel:
         cands: List[Candidate],
         support_count_map: Dict[Tuple[int, int, int], int],
         support_udt_map: Dict[Tuple[int, int, int], int],
+        local_density_map: Dict[Tuple[int, int], int],
         cell_xy: float,
     ) -> np.ndarray:
         out = np.zeros((len(cands),), dtype=np.float32)
         cs = float(max(cell_xy, 1e-6))
         for i, c in enumerate(cands):
             x, y = _cand_xy(c)
-            key = (int(getattr(c, "label", -1)), int(np.round(x / cs)), int(np.round(y / cs)))
+            gx = int(np.round(x / cs))
+            gy = int(np.round(y / cs))
+            key = (int(getattr(c, "label", -1)), gx, gy)
+            support_count = int(support_count_map.get(key, 1))
+            support_udt = int(support_udt_map.get(key, 1))
+            temporal_stability = float(support_udt / max(1, support_count))
             fd = self._feature_dict(
                 c,
-                support_count=int(support_count_map.get(key, 1)),
-                support_unique_dt=int(support_udt_map.get(key, 1)),
+                support_count=support_count,
+                support_unique_dt=support_udt,
+                temporal_stability=temporal_stability,
+                local_density=int(local_density_map.get((gx, gy), 1)),
             )
             xv = np.asarray([float(fd.get(n, 0.0)) for n in self.feature_names], dtype=np.float64)
             if self.normalize:
                 xv = (xv - self.mu) / np.where(np.abs(self.std) < 1e-8, 1.0, self.std)
-            lg = float(np.dot(self.w, xv) + self.b)
+            if self.is_structured:
+                h = np.maximum(0.0, xv @ self.mlp_w1 + self.mlp_b1)
+                lg = float(h @ self.mlp_w2 + self.mlp_b2)
+            else:
+                lg = float(np.dot(self.w, xv) + self.b)
+            if self.rel_enabled and len(self.rel_feature_names) > 0:
+                rel_vals: List[float] = []
+                for n in self.rel_feature_names:
+                    v = float(fd.get(n, 0.0))
+                    if self.normalize and (n in self._feat_idx):
+                        j = int(self._feat_idx[n])
+                        den = self.std[j] if abs(self.std[j]) >= 1e-8 else 1.0
+                        v = float((v - self.mu[j]) / den)
+                    rel_vals.append(v)
+                rel_x = np.asarray(rel_vals, dtype=np.float64)
+                lg += float(np.dot(self.rel_w, rel_x) + self.rel_b)
             out[i] = np.float32(lg)
         return out
+
+    def _pair_feature_dict(self, ci: Candidate, cj: Candidate) -> Dict[str, float]:
+        li = int(getattr(ci, "label", -1))
+        lj = int(getattr(cj, "label", -1))
+        d2 = _dist2_xy(_cand_xy(ci), _cand_xy(cj))
+        d = float(np.sqrt(max(d2, 0.0)))
+        rad = float(max(self.pair_radius, 1e-6))
+        close = float(np.exp(-d / rad))
+        ov = float(_bev_overlap_ratio_min(ci, cj))
+        dti = int(getattr(ci, "from_dt", 0))
+        dtj = int(getattr(cj, "from_dt", 0))
+        abi = abs(dti - dtj)
+        wi = 1.0 if _source_group(ci) == "warp" else 0.0
+        wj = 1.0 if _source_group(cj) == "warp" else 0.0
+        return {
+            "same_label": 1.0 if li == lj else 0.0,
+            "close": close,
+            "overlap": ov,
+            "abs_dt_diff": float(min(abi, 8)) / 8.0,
+            "both_warp": wi * wj,
+            "either_warp": 1.0 if (wi + wj) > 0.0 else 0.0,
+            "score_min": float(min(float(getattr(ci, "score", 0.0)), float(getattr(cj, "score", 0.0)))),
+            "speed_diff": float(min(abs(_cand_speed(ci) - _cand_speed(cj)), 10.0)) / 10.0,
+            "same_dt": 1.0 if dti == dtj else 0.0,
+        }
+
+    def learned_pair_energy(self, ci: Candidate, cj: Candidate) -> float:
+        if (not self.pair_enabled) or len(self.pair_feature_names) == 0:
+            return 0.0
+        fd = self._pair_feature_dict(ci, cj)
+        x = np.asarray([float(fd.get(n, 0.0)) for n in self.pair_feature_names], dtype=np.float64)
+        logit = float(np.dot(self.pair_w, x) + self.pair_b)
+        p = float(_sigmoid(np.asarray([logit], dtype=np.float64))[0])
+        # lower energy for supportive pairs (p -> 1), higher for conflicting pairs (p -> 0)
+        return float(self.pair_scale * (0.5 - p))
 
 
 def _load_unary_model(path: Optional[str]) -> Optional[_UnaryLinearModel]:
@@ -336,17 +497,26 @@ def _load_unary_model(path: Optional[str]) -> Optional[_UnaryLinearModel]:
 def _build_unary_support_xy_maps(
     cands: List[Candidate],
     cell_xy: float,
-) -> Tuple[Dict[Tuple[int, int, int], int], Dict[Tuple[int, int, int], int]]:
+) -> Tuple[
+    Dict[Tuple[int, int, int], int],
+    Dict[Tuple[int, int, int], int],
+    Dict[Tuple[int, int], int],
+]:
     cs = float(max(cell_xy, 1e-6))
     count_map: Dict[Tuple[int, int, int], int] = {}
     dtset_map: Dict[Tuple[int, int, int], Set[int]] = {}
+    local_density_map: Dict[Tuple[int, int], int] = {}
     for c in cands:
         x, y = _cand_xy(c)
-        key = (int(getattr(c, "label", -1)), int(np.round(x / cs)), int(np.round(y / cs)))
+        gx = int(np.round(x / cs))
+        gy = int(np.round(y / cs))
+        key = (int(getattr(c, "label", -1)), gx, gy)
         count_map[key] = count_map.get(key, 0) + 1
         dtset_map.setdefault(key, set()).add(int(getattr(c, "from_dt", 0)))
+        k2 = (gx, gy)
+        local_density_map[k2] = local_density_map.get(k2, 0) + 1
     udt_count_map = {k: len(v) for k, v in dtset_map.items()}
-    return count_map, udt_count_map
+    return count_map, udt_count_map, local_density_map
 
 
 # -----------------------------------------------------------------------------
@@ -551,25 +721,55 @@ def infer_attr_for_candidate(
 # Pair energy (NMS-like)
 # -----------------------------------------------------------------------------
 
-def pair_energy(ci: Candidate, cj: Candidate, cfg: EBMConfig) -> float:
-    if (not cfg.nms_cross_class) and (int(getattr(ci, "label", -1)) != int(getattr(cj, "label", -1))):
+def pair_energy(
+    ci: Candidate,
+    cj: Candidate,
+    cfg: EBMConfig,
+    unary_model: Optional[_UnaryLinearModel] = None,
+) -> float:
+    li = int(getattr(ci, "label", -1))
+    lj = int(getattr(cj, "label", -1))
+    same_cls = li == lj
+    if (not cfg.nms_cross_class) and (not same_cls):
         return 0.0
 
-    thr = float(cfg.nms_thr_xy)
-    if thr <= 0:
-        return 0.0
-
-    thr2 = thr * thr
+    e = 0.0
     d2 = _dist2_xy(_cand_xy(ci), _cand_xy(cj))
-    if d2 > thr2:
-        return 0.0
 
-    if cfg.hard_nms:
-        return float(cfg.inf_energy)
+    # (A) NMS-like distance penalty
+    thr = float(cfg.nms_thr_xy)
+    if thr > 0:
+        thr2 = thr * thr
+        if d2 <= thr2:
+            if cfg.hard_nms:
+                return float(cfg.inf_energy)
+            d = float(np.sqrt(max(d2, 0.0)))
+            pen = 1.0 - min(d / max(thr, 1e-6), 1.0)
+            e += float(cfg.w_pair * cfg.soft_pair_scale * pen)
 
-    d = float(np.sqrt(max(d2, 0.0)))
-    pen = 1.0 - min(d / max(thr, 1e-6), 1.0)
-    return float(cfg.w_pair * cfg.soft_pair_scale * pen)
+    # (B) Soft overlap penalty
+    if bool(getattr(cfg, "enable_overlap_soft", True)) and same_cls:
+        ov = _bev_overlap_ratio_min(ci, cj)
+        if ov >= float(getattr(cfg, "overlap_min_ratio", 0.10)):
+            e += float(getattr(cfg, "overlap_soft_scale", 1.0)) * float(ov)
+
+    # (C) Temporal pair consistency bonus (negative energy)
+    if bool(getattr(cfg, "enable_temporal_pair", True)) and same_cls:
+        dti = int(getattr(ci, "from_dt", 0))
+        dtj = int(getattr(cj, "from_dt", 0))
+        if dti != dtj:
+            if (not bool(getattr(cfg, "temporal_pair_warp_only", True))) or (dti != 0 or dtj != 0):
+                rad = float(getattr(cfg, "temporal_pair_radius", 1.5))
+                if rad > 0:
+                    rad2 = rad * rad
+                    if d2 <= rad2:
+                        w = 1.0 - min(float(np.sqrt(max(d2, 0.0))) / max(rad, 1e-6), 1.0)
+                        e -= float(getattr(cfg, "temporal_pair_bonus", 0.30)) * float(w)
+
+    if bool(getattr(cfg, "enable_learned_pair", True)) and unary_model is not None:
+        e += float(unary_model.learned_pair_energy(ci, cj))
+
+    return float(e)
 
 
 # -----------------------------------------------------------------------------
@@ -656,7 +856,9 @@ def _greedy_select(
     keep_logits: np.ndarray,
     keep_probs: np.ndarray,
     attr_energy_arr: np.ndarray,
+    rel_energy_arr: np.ndarray,
     cfg: EBMConfig,
+    unary_model: Optional[_UnaryLinearModel] = None,
     *,
     prob_thr: float,
     already_selected: Optional[List[int]] = None,
@@ -738,12 +940,16 @@ def _greedy_select(
             if too_close:
                 continue
 
-        unary = unary_energy_keep_on(float(keep_logits[i]), cfg) + float(attr_energy_arr[i])
+        unary = (
+            unary_energy_keep_on(float(keep_logits[i]), cfg)
+            + float(attr_energy_arr[i])
+            + float(rel_energy_arr[i])
+        )
 
         pair_sum = 0.0
         reject = False
         for j in neighbor_sel:
-            eij = pair_energy(ci, cands[j], cfg)
+            eij = pair_energy(ci, cands[j], cfg, unary_model=unary_model)
             if eij >= cfg.inf_energy * 0.5:
                 reject = True
                 break
@@ -785,18 +991,21 @@ def solve_candidates(
         sv = cell_support_value(c, cfg, cell_count, cell_dtset)
         support_vals[i] = int(sv)
 
+    # Shared XY support/density maps for learned terms.
+    cell_xy_feat = float(cfg.support_cell_xy if cfg.support_cell_xy > 0 else cfg.dt_cell_size)
+    sup_count_map, sup_udt_map, local_density_map = _build_unary_support_xy_maps(cands, cell_xy=cell_xy_feat)
+
     unary_model: Optional[_UnaryLinearModel] = None
     if bool(cfg.unary_use_learned):
         unary_model = _load_unary_model(cfg.unary_ckpt_path)
 
     if unary_model is not None:
-        cell_xy = float(cfg.support_cell_xy if cfg.support_cell_xy > 0 else cfg.dt_cell_size)
-        sup_count_map, sup_udt_map = _build_unary_support_xy_maps(cands, cell_xy=cell_xy)
         keep_logits = unary_model.predict_logits(
             cands,
             support_count_map=sup_count_map,
             support_udt_map=sup_udt_map,
-            cell_xy=cell_xy,
+            local_density_map=local_density_map,
+            cell_xy=cell_xy_feat,
         )
         keep_probs = _sigmoid(keep_logits.astype(np.float32))
     else:
@@ -820,9 +1029,146 @@ def solve_candidates(
             _, probs = infer_attr_for_candidate(c, cfg, cell_speed_map=cell_speed_map)
             attr_energy_arr[i] = float(attr_energy_from_probs(probs, cfg))
 
-    selected_idx: List[int] = []
+    # Relation-energy terms:
+    #   (1) soften dt-support filtering in stage-2
+    #   (2) context-density shortfall penalty
+    rel_energy_arr = np.zeros((N,), dtype=np.float32)
+    if bool(getattr(cfg, "soft_dt_support", True)) and float(getattr(cfg, "dt_shortfall_penalty", 0.0)) > 0.0:
+        min_sup = int(max(0, cfg.min_dt_support))
+        pen = float(cfg.dt_shortfall_penalty)
+        for i in range(N):
+            shortfall = max(0, min_sup - int(support_vals[i]))
+            if shortfall > 0:
+                rel_energy_arr[i] = np.float32(pen * float(shortfall))
 
-    if cfg.two_stage:
+    if bool(getattr(cfg, "enable_context_density", True)) and float(getattr(cfg, "context_shortfall_penalty", 0.0)) > 0.0:
+        cxy = float(max(getattr(cfg, "context_cell_xy", 1.0), 1e-6))
+        _, _, ctx_density_map = _build_unary_support_xy_maps(cands, cell_xy=cxy)
+        dmin = int(max(0, getattr(cfg, "context_min_density", 2)))
+        dpen = float(getattr(cfg, "context_shortfall_penalty", 0.15))
+        warp_only = bool(getattr(cfg, "context_warp_only", True))
+        for i, c in enumerate(cands):
+            if warp_only and (_source_group(c) != "warp"):
+                continue
+            x, y = _cand_xy(c)
+            gx = int(np.round(x / cxy))
+            gy = int(np.round(y / cxy))
+            dens = int(ctx_density_map.get((gx, gy), 1))
+            shortfall = max(0, dmin - dens)
+            if shortfall > 0:
+                rel_energy_arr[i] += np.float32(dpen * float(shortfall))
+
+    selected_idx: List[int] = []
+    mode = str(getattr(cfg, "energy_mode", "legacy")).strip().lower()
+    if mode not in ("four_term", "legacy"):
+        raise ValueError(f"Unsupported energy_mode: {mode}")
+
+    if mode == "four_term":
+        # Unified EBM solve: one candidate pool, greedy delta-energy minimization.
+        # deltaE(i | S) = E_unary(i) + E_rel(i) + sum_j E_pair(i,j)
+        # Keep candidate when deltaE < energy_select_margin.
+        # If energy_prob_gate <= 0, fall back to keep_thr so trained unary threshold remains effective.
+        gate_cfg = float(getattr(cfg, "energy_prob_gate", 0.0))
+        gate = float(cfg.keep_thr) if gate_cfg <= 0.0 else gate_cfg
+        pool = [i for i in range(N) if float(keep_probs[i]) >= gate]
+        ordered = sorted(
+            pool,
+            key=lambda i: float(
+                unary_energy_keep_on(float(keep_logits[i]), cfg)
+                + float(attr_energy_arr[i])
+                + float(rel_energy_arr[i])
+            ),
+        )
+
+        kept_count_by_class: Dict[int, int] = {}
+        margin = float(getattr(cfg, "energy_select_margin", 0.0))
+        unary_term = (
+            np.asarray([unary_energy_keep_on(float(keep_logits[i]), cfg) for i in range(N)], dtype=np.float32)
+            + attr_energy_arr
+            + rel_energy_arr
+        )
+        for i in ordered:
+            ci = cands[i]
+            lab_i = int(getattr(ci, "label", -1))
+            if cfg.max_per_class is not None and kept_count_by_class.get(lab_i, 0) >= int(cfg.max_per_class):
+                continue
+
+            delta_e = float(unary_term[i])
+            reject = False
+            for j in selected_idx:
+                eij = float(pair_energy(ci, cands[j], cfg, unary_model=unary_model))
+                if eij >= cfg.inf_energy * 0.5:
+                    reject = True
+                    break
+                delta_e += eij
+            if reject:
+                continue
+
+            if delta_e < margin:
+                selected_idx.append(i)
+                if cfg.max_per_class is not None:
+                    kept_count_by_class[lab_i] = kept_count_by_class.get(lab_i, 0) + 1
+
+        # Optional local refinement to better align final set with energy objective.
+        selected_before_refine = int(len(selected_idx))
+        if bool(getattr(cfg, "energy_local_refine", True)) and len(selected_idx) > 0:
+            rounds = int(max(0, getattr(cfg, "energy_local_refine_rounds", 2)))
+            sel_set = set(int(i) for i in selected_idx)
+
+            def _can_add(idx: int) -> bool:
+                if cfg.max_per_class is None:
+                    return True
+                lab = int(getattr(cands[idx], "label", -1))
+                cnt = 0
+                for j in sel_set:
+                    if int(getattr(cands[j], "label", -1)) == lab:
+                        cnt += 1
+                return cnt < int(cfg.max_per_class)
+
+            for _ in range(rounds):
+                changed = False
+
+                # remove pass: if candidate no longer satisfies delta < margin in current context
+                for i in list(sel_set):
+                    delta_i = float(unary_term[i])
+                    reject = False
+                    for j in sel_set:
+                        if j == i:
+                            continue
+                        eij = float(pair_energy(cands[i], cands[j], cfg, unary_model=unary_model))
+                        if eij >= cfg.inf_energy * 0.5:
+                            reject = True
+                            break
+                        delta_i += eij
+                    if reject or (delta_i >= margin):
+                        sel_set.remove(i)
+                        changed = True
+
+                # add pass: try to include candidates that now become favorable
+                for i in ordered:
+                    if i in sel_set:
+                        continue
+                    if not _can_add(i):
+                        continue
+                    delta_i = float(unary_term[i])
+                    reject = False
+                    for j in sel_set:
+                        eij = float(pair_energy(cands[i], cands[j], cfg, unary_model=unary_model))
+                        if eij >= cfg.inf_energy * 0.5:
+                            reject = True
+                            break
+                        delta_i += eij
+                    if (not reject) and (delta_i < margin):
+                        sel_set.add(i)
+                        changed = True
+
+                if not changed:
+                    break
+
+            selected_idx = sorted(list(sel_set), key=lambda i: float(keep_logits[i]), reverse=True)
+    else:
+        selected_before_refine = int(len(selected_idx))
+    if mode != "four_term" and cfg.two_stage:
         # -------- Stage-1 seed pool --------
         if cfg.seed_sources == "raw":
             pool_seed = [i for i, c in enumerate(cands) if _source_group(c) == "raw"]
@@ -841,7 +1187,9 @@ def solve_candidates(
             keep_logits=keep_logits,
             keep_probs=keep_probs,
             attr_energy_arr=attr_energy_arr,
+            rel_energy_arr=rel_energy_arr,
             cfg=cfg,
+            unary_model=unary_model,
             prob_thr=float(cfg.seed_keep_thr),
             already_selected=[],
             max_add=None,
@@ -859,7 +1207,7 @@ def solve_candidates(
                 continue
             if float(keep_probs[i]) < float(cfg.fill_keep_thr):
                 continue
-            if int(support_vals[i]) < int(cfg.min_dt_support):
+            if (not bool(getattr(cfg, "soft_dt_support", True))) and int(support_vals[i]) < int(cfg.min_dt_support):
                 continue
             pool_fill.append(i)
 
@@ -873,21 +1221,25 @@ def solve_candidates(
             keep_logits=keep_logits,
             keep_probs=keep_probs,
             attr_energy_arr=attr_energy_arr,
+            rel_energy_arr=rel_energy_arr,
             cfg=cfg,
+            unary_model=unary_model,
             prob_thr=float(cfg.fill_keep_thr),
             already_selected=selected_idx,
             max_add=int(cfg.max_fill),
             min_dist_to_selected=float(cfg.min_dist_to_seed),
         )
 
-    else:
+    elif mode != "four_term":
         selected_idx = _greedy_select(
             pool_idx=list(range(N)),
             cands=cands,
             keep_logits=keep_logits,
             keep_probs=keep_probs,
             attr_energy_arr=attr_energy_arr,
+            rel_energy_arr=rel_energy_arr,
             cfg=cfg,
+            unary_model=unary_model,
             prob_thr=float(cfg.keep_thr),
             already_selected=[],
             max_add=None,
@@ -899,11 +1251,22 @@ def solve_candidates(
         selected_idx = sorted(selected_idx, key=lambda i: float(keep_logits[i]), reverse=True)[: int(cfg.topk)]
 
     dbg: Dict[str, Any] = {
+        "energy_mode": str(mode),
         "num_cands": int(N),
         "selected": int(len(selected_idx)),
         "use_learned_unary": bool(unary_model is not None),
         "unary_ckpt_path": str(cfg.unary_ckpt_path) if cfg.unary_ckpt_path else None,
+        "soft_dt_support": bool(getattr(cfg, "soft_dt_support", True)),
+        "dt_shortfall_penalty": float(getattr(cfg, "dt_shortfall_penalty", 0.0)),
+        "mean_rel_energy": float(np.mean(rel_energy_arr)) if rel_energy_arr.size > 0 else 0.0,
     }
+    if mode == "four_term":
+        gate_cfg = float(getattr(cfg, "energy_prob_gate", 0.0))
+        dbg["energy_prob_gate_cfg"] = gate_cfg
+        dbg["energy_prob_gate_eff"] = float(cfg.keep_thr) if gate_cfg <= 0.0 else gate_cfg
+        dbg["energy_local_refine"] = bool(getattr(cfg, "energy_local_refine", True))
+        dbg["energy_local_refine_rounds"] = int(max(0, getattr(cfg, "energy_local_refine_rounds", 0)))
+        dbg["selected_before_local_refine"] = int(selected_before_refine)
     # Internal cache for ebm_infer_candidates to avoid recomputing keep/attr stats.
     dbg["_cache"] = {
         "keep_logits": keep_logits,
@@ -915,10 +1278,14 @@ def solve_candidates(
         tot_unary = 0.0
         tot_pair = 0.0
         for ii in selected_idx:
-            tot_unary += float(unary_energy_keep_on(float(keep_logits[ii]), cfg) + float(attr_energy_arr[ii]))
+            tot_unary += float(
+                unary_energy_keep_on(float(keep_logits[ii]), cfg)
+                + float(attr_energy_arr[ii])
+                + float(rel_energy_arr[ii])
+            )
         for a in range(len(selected_idx)):
             for b in range(a + 1, len(selected_idx)):
-                tot_pair += float(pair_energy(cands[selected_idx[a]], cands[selected_idx[b]], cfg))
+                tot_pair += float(pair_energy(cands[selected_idx[a]], cands[selected_idx[b]], cfg, unary_model=unary_model))
         dbg.update(
             {
                 "E_unary": float(tot_unary),

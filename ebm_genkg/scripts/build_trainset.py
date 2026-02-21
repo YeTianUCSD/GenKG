@@ -103,24 +103,47 @@ def _source_flags(c: Candidate) -> Tuple[float, float, float]:
     return is_raw, is_warp, is_other
 
 
-def _support_stats(cands: List[Candidate], cell: float) -> Tuple[Dict[Tuple[int, int, int], int], Dict[Tuple[int, int, int], int]]:
-    """Return (count_map, unique_dt_count_map) keyed by (label, gx, gy)."""
+def _support_stats(
+    cands: List[Candidate],
+    cell: float,
+) -> Tuple[
+    Dict[Tuple[int, int, int], int],
+    Dict[Tuple[int, int, int], int],
+    Dict[Tuple[int, int], int],
+]:
+    """
+    Return:
+      - count_map: keyed by (label, gx, gy)
+      - unique_dt_count_map: keyed by (label, gx, gy)
+      - local_density_map: keyed by (gx, gy), counts all labels in the same cell
+    """
     cs = float(max(cell, 1e-6))
     count_map: Dict[Tuple[int, int, int], int] = {}
     dt_map: Dict[Tuple[int, int, int], Set[int]] = {}
+    local_density_map: Dict[Tuple[int, int], int] = {}
 
     for c in cands:
         b = np.asarray(c.box, dtype=np.float32)
         x, y = float(b[0]), float(b[1])
-        k = (int(c.label), int(np.round(x / cs)), int(np.round(y / cs)))
+        gx = int(np.round(x / cs))
+        gy = int(np.round(y / cs))
+        k = (int(c.label), gx, gy)
         count_map[k] = count_map.get(k, 0) + 1
         dt_map.setdefault(k, set()).add(int(c.from_dt))
+        k2 = (gx, gy)
+        local_density_map[k2] = local_density_map.get(k2, 0) + 1
 
     unique_dt_count = {k: len(v) for k, v in dt_map.items()}
-    return count_map, unique_dt_count
+    return count_map, unique_dt_count, local_density_map
 
 
-def _feature_row(c: Candidate, count_map: Dict[Tuple[int, int, int], int], unique_dt_count_map: Dict[Tuple[int, int, int], int], cell: float) -> List[float]:
+def _feature_row(
+    c: Candidate,
+    count_map: Dict[Tuple[int, int, int], int],
+    unique_dt_count_map: Dict[Tuple[int, int, int], int],
+    local_density_map: Dict[Tuple[int, int], int],
+    cell: float,
+) -> List[float]:
     b = np.asarray(c.box, dtype=np.float32)
     if b.shape[0] < 9:
         b = np.pad(b, (0, max(0, 9 - b.shape[0])), mode="constant")
@@ -136,9 +159,13 @@ def _feature_row(c: Candidate, count_map: Dict[Tuple[int, int, int], int], uniqu
     x, y, z, dx, dy, dz, yaw, vx, vy = [float(v) if np.isfinite(float(v)) else 0.0 for v in b[:9]]
 
     cs = float(max(cell, 1e-6))
-    k = (int(c.label), int(np.round(x / cs)), int(np.round(y / cs)))
+    gx = int(np.round(x / cs))
+    gy = int(np.round(y / cs))
+    k = (int(c.label), gx, gy)
     support_count = float(count_map.get(k, 1))
     support_unique_dt = float(unique_dt_count_map.get(k, 1))
+    temporal_stability = float(support_unique_dt / max(1.0, support_count))
+    local_density = float(local_density_map.get((gx, gy), 1))
 
     return [
         score,
@@ -160,6 +187,8 @@ def _feature_row(c: Candidate, count_map: Dict[Tuple[int, int, int], int], uniqu
         vy,
         support_count,
         support_unique_dt,
+        temporal_stability,
+        local_density,
     ]
 
 
@@ -184,6 +213,8 @@ def _feature_names() -> List[str]:
         "vy",
         "support_count",
         "support_unique_dt",
+        "temporal_stability",
+        "local_density",
     ]
 
 
@@ -298,10 +329,16 @@ def main() -> None:
                 cls_arr = mt.cls_tgt
                 attr_list = mt.attr_tgt
 
-            count_map, unique_dt_count_map = _support_stats(cands, cell=float(args.support_cell))
+            count_map, unique_dt_count_map, local_density_map = _support_stats(cands, cell=float(args.support_cell))
 
             for i, c in enumerate(cands):
-                feat = _feature_row(c, count_map, unique_dt_count_map, cell=float(args.support_cell))
+                feat = _feature_row(
+                    c,
+                    count_map,
+                    unique_dt_count_map,
+                    local_density_map,
+                    cell=float(args.support_cell),
+                )
                 X.append(feat)
 
                 k = int(keep_arr[i])

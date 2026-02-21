@@ -17,7 +17,7 @@ ignore_classes: "-1"
 # candidate generation
 use_warp: true
 warp_radius: 2
-warp_topk: 120
+warp_topk: 200
 warp_decay: 0.9
 raw_score_min: 0.05
 max_per_frame: 180

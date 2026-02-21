@@ -1,0 +1,29 @@
+# run with:
+# python scripts/train_energy.py --config configs/train_energy.yaml
+
+in_npz: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset.npz
+out_ckpt: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/energy_logreg.json
+out_summary: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/energy_logreg.summary.json
+
+# split
+val_ratio: 0.2
+seed: 42
+split_by: scene
+
+# training
+normalize: true
+epochs: 12
+batch_size: 32768
+lr: 0.05
+l2: 1.0e-6
+
+# class imbalance
+pos_weight_mode: auto
+pos_weight: 1.0
+
+# threshold selection on val (f2 favors recall)
+threshold_metric: f2
+threshold_grid: "0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60"
+
+# optional cap for quick debug
+max_train_rows: null

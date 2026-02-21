@@ -175,6 +175,42 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Only used in full profile.")
     ap.add_argument("--prefilter_topm_fills", type=str, default="700,1200",
                     help="Only used in full profile.")
+    ap.add_argument(
+        "--temporal_pair_bonuses",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_temporal_pair_bonus. Empty => use base config value only.",
+    )
+    ap.add_argument(
+        "--overlap_soft_scales",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_overlap_soft_scale. Empty => use base config value only.",
+    )
+    ap.add_argument(
+        "--context_shortfall_penalties",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_context_shortfall_penalty. Empty => use base config value only.",
+    )
+    ap.add_argument(
+        "--energy_prob_gates",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_energy_prob_gate (four_term mode). Empty => fallback to seed_keep_thrs/base keep_thr.",
+    )
+    ap.add_argument(
+        "--energy_select_margins",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_energy_select_margin (four_term mode). Empty => use base config value only.",
+    )
+    ap.add_argument(
+        "--ebm_w_pairs",
+        type=str,
+        default="",
+        help="Comma-separated values for ebm_w_pair (four_term mode). Empty => use base config value only.",
+    )
     return ap
 
 
@@ -189,18 +225,66 @@ def main() -> None:
     eval_base = _load_cfg(args.eval_config)
     py = sys.executable
 
-    core_space = list(
-        itertools.product(
-            _parse_float_list(args.seed_keep_thrs),
-            _parse_float_list(args.fill_keep_thrs),
-            _parse_int_list(args.min_dt_supports),
-            _parse_float_list(args.min_dist_to_seeds),
-            _parse_int_list(args.max_fills),
-            _parse_float_list(args.nms_thrs),
-        )
-    )
-    if args.search_profile == "full":
-        full_space = list(
+    temporal_pair_bonuses = _parse_float_list(args.temporal_pair_bonuses)
+    overlap_soft_scales = _parse_float_list(args.overlap_soft_scales)
+    context_shortfall_penalties = _parse_float_list(args.context_shortfall_penalties)
+    if len(temporal_pair_bonuses) == 0:
+        temporal_pair_bonuses = [float(infer_base.get("ebm_temporal_pair_bonus", 0.30))]
+    if len(overlap_soft_scales) == 0:
+        overlap_soft_scales = [float(infer_base.get("ebm_overlap_soft_scale", 1.00))]
+    if len(context_shortfall_penalties) == 0:
+        context_shortfall_penalties = [float(infer_base.get("ebm_context_shortfall_penalty", 0.15))]
+
+    energy_mode = str(infer_base.get("ebm_energy_mode", "legacy")).strip().lower()
+    is_four_term = (energy_mode == "four_term")
+
+    if is_four_term:
+        energy_prob_gates = _parse_float_list(args.energy_prob_gates)
+        if len(energy_prob_gates) == 0:
+            energy_prob_gates = _parse_float_list(args.seed_keep_thrs)
+        if len(energy_prob_gates) == 0:
+            energy_prob_gates = [float(infer_base.get("keep_thr", 0.5))]
+
+        energy_select_margins = _parse_float_list(args.energy_select_margins)
+        if len(energy_select_margins) == 0:
+            energy_select_margins = [float(infer_base.get("ebm_energy_select_margin", 0.0))]
+
+        ebm_w_pairs = _parse_float_list(args.ebm_w_pairs)
+        if len(ebm_w_pairs) == 0:
+            ebm_w_pairs = [float(infer_base.get("ebm_w_pair", 1.0))]
+
+        if args.search_profile == "full":
+            space = list(
+                itertools.product(
+                    energy_prob_gates,
+                    energy_select_margins,
+                    ebm_w_pairs,
+                    _parse_float_list(args.nms_thrs),
+                    _parse_int_list(args.prefilter_topm_seeds),
+                    _parse_int_list(args.prefilter_topm_fills),
+                    temporal_pair_bonuses,
+                    overlap_soft_scales,
+                    context_shortfall_penalties,
+                )
+            )
+        else:
+            base_seed = int(infer_base.get("ebm_prefilter_topm_seed", 500))
+            base_fill = int(infer_base.get("ebm_prefilter_topm_fill", 700))
+            space = list(
+                itertools.product(
+                    energy_prob_gates,
+                    energy_select_margins,
+                    ebm_w_pairs,
+                    _parse_float_list(args.nms_thrs),
+                    [base_seed],
+                    [base_fill],
+                    temporal_pair_bonuses,
+                    overlap_soft_scales,
+                    context_shortfall_penalties,
+                )
+            )
+    else:
+        core_space = list(
             itertools.product(
                 _parse_float_list(args.seed_keep_thrs),
                 _parse_float_list(args.fill_keep_thrs),
@@ -208,19 +292,35 @@ def main() -> None:
                 _parse_float_list(args.min_dist_to_seeds),
                 _parse_int_list(args.max_fills),
                 _parse_float_list(args.nms_thrs),
-                _parse_int_list(args.prefilter_topm_seeds),
-                _parse_int_list(args.prefilter_topm_fills),
+                temporal_pair_bonuses,
+                overlap_soft_scales,
+                context_shortfall_penalties,
             )
         )
-        space = full_space
-    else:
-        # Fix prefilter params to base infer config; focus on key knobs.
-        base_seed = int(infer_base.get("ebm_prefilter_topm_seed", 500))
-        base_fill = int(infer_base.get("ebm_prefilter_topm_fill", 700))
-        space = [
-            (a, b, c, d, e, f, base_seed, base_fill)
-            for (a, b, c, d, e, f) in core_space
-        ]
+        if args.search_profile == "full":
+            space = list(
+                itertools.product(
+                    _parse_float_list(args.seed_keep_thrs),
+                    _parse_float_list(args.fill_keep_thrs),
+                    _parse_int_list(args.min_dt_supports),
+                    _parse_float_list(args.min_dist_to_seeds),
+                    _parse_int_list(args.max_fills),
+                    _parse_float_list(args.nms_thrs),
+                    _parse_int_list(args.prefilter_topm_seeds),
+                    _parse_int_list(args.prefilter_topm_fills),
+                    temporal_pair_bonuses,
+                    overlap_soft_scales,
+                    context_shortfall_penalties,
+                )
+            )
+        else:
+            # Fix prefilter params to base infer config; focus on key knobs.
+            base_seed = int(infer_base.get("ebm_prefilter_topm_seed", 500))
+            base_fill = int(infer_base.get("ebm_prefilter_topm_fill", 700))
+            space = [
+                (a, b, c, d, e, f, base_seed, base_fill, g, h, k)
+                for (a, b, c, d, e, f, g, h, k) in core_space
+            ]
 
     if len(space) > int(args.max_trials):
         # Sample to bound runtime.
@@ -232,7 +332,7 @@ def main() -> None:
         space = [space[i] for i in idx]
 
     print(
-        f"[tune] profile={args.search_profile} trials={len(space)} "
+        f"[tune] mode={energy_mode} profile={args.search_profile} trials={len(space)} "
         f"target_recall={args.target_recall:.4f} max_trials={args.max_trials}"
     )
 
@@ -240,23 +340,52 @@ def main() -> None:
     best: Optional[Dict[str, Any]] = None
     best_cfg: Optional[Dict[str, Any]] = None
 
-    for i, (seed_keep, fill_keep, min_dt, min_dist, max_fill, nms_thr, topm_seed, topm_fill) in enumerate(space, start=1):
+    for i, rec in enumerate(space, start=1):
         tag = f"trial_{i:03d}"
-        print(
-            f"\n[{i}/{len(space)}] seed={seed_keep:.2f} fill={fill_keep:.2f} min_dt={min_dt} "
-            f"min_dist={min_dist:.2f} max_fill={max_fill} nms={nms_thr:.2f} "
-            f"topm=({topm_seed},{topm_fill})"
-        )
 
         infer_cfg = dict(infer_base)
-        infer_cfg["seed_keep_thr"] = float(seed_keep)
-        infer_cfg["fill_keep_thr"] = float(fill_keep)
-        infer_cfg["min_dt_support"] = int(min_dt)
-        infer_cfg["min_dist_to_seed"] = float(min_dist)
-        infer_cfg["max_fill"] = int(max_fill)
-        infer_cfg["nms_thr"] = float(nms_thr)
-        infer_cfg["ebm_prefilter_topm_seed"] = int(topm_seed)
-        infer_cfg["ebm_prefilter_topm_fill"] = int(topm_fill)
+        if is_four_term:
+            (
+                energy_prob_gate, energy_margin, w_pair, nms_thr,
+                topm_seed, topm_fill, temporal_bonus, overlap_scale, context_penalty
+            ) = rec
+            print(
+                f"\n[{i}/{len(space)}] gate={energy_prob_gate:.2f} margin={energy_margin:.2f} "
+                f"w_pair={w_pair:.2f} nms={nms_thr:.2f} topm=({topm_seed},{topm_fill}) "
+                f"tpair={temporal_bonus:.2f} overlap={overlap_scale:.2f} ctx={context_penalty:.2f}"
+            )
+            infer_cfg["ebm_energy_mode"] = "four_term"
+            infer_cfg["ebm_energy_prob_gate"] = float(energy_prob_gate)
+            infer_cfg["ebm_energy_select_margin"] = float(energy_margin)
+            infer_cfg["ebm_w_pair"] = float(w_pair)
+            infer_cfg["nms_thr"] = float(nms_thr)
+            infer_cfg["ebm_prefilter_topm_seed"] = int(topm_seed)
+            infer_cfg["ebm_prefilter_topm_fill"] = int(topm_fill)
+            infer_cfg["ebm_temporal_pair_bonus"] = float(temporal_bonus)
+            infer_cfg["ebm_overlap_soft_scale"] = float(overlap_scale)
+            infer_cfg["ebm_context_shortfall_penalty"] = float(context_penalty)
+        else:
+            (
+                seed_keep, fill_keep, min_dt, min_dist, max_fill, nms_thr,
+                topm_seed, topm_fill, temporal_bonus, overlap_scale, context_penalty
+            ) = rec
+            print(
+                f"\n[{i}/{len(space)}] seed={seed_keep:.2f} fill={fill_keep:.2f} min_dt={min_dt} "
+                f"min_dist={min_dist:.2f} max_fill={max_fill} nms={nms_thr:.2f} "
+                f"topm=({topm_seed},{topm_fill}) "
+                f"tpair={temporal_bonus:.2f} overlap={overlap_scale:.2f} ctx={context_penalty:.2f}"
+            )
+            infer_cfg["seed_keep_thr"] = float(seed_keep)
+            infer_cfg["fill_keep_thr"] = float(fill_keep)
+            infer_cfg["min_dt_support"] = int(min_dt)
+            infer_cfg["min_dist_to_seed"] = float(min_dist)
+            infer_cfg["max_fill"] = int(max_fill)
+            infer_cfg["nms_thr"] = float(nms_thr)
+            infer_cfg["ebm_prefilter_topm_seed"] = int(topm_seed)
+            infer_cfg["ebm_prefilter_topm_fill"] = int(topm_fill)
+            infer_cfg["ebm_temporal_pair_bonus"] = float(temporal_bonus)
+            infer_cfg["ebm_overlap_soft_scale"] = float(overlap_scale)
+            infer_cfg["ebm_context_shortfall_penalty"] = float(context_penalty)
         if args.limit_scenes is not None:
             infer_cfg["limit_scenes"] = int(args.limit_scenes)
 
@@ -313,14 +442,7 @@ def main() -> None:
 
         row: Dict[str, Any] = {
             "trial": tag,
-            "seed_keep_thr": float(seed_keep),
-            "fill_keep_thr": float(fill_keep),
-            "min_dt_support": int(min_dt),
-            "min_dist_to_seed": float(min_dist),
-            "max_fill": int(max_fill),
-            "nms_thr": float(nms_thr),
-            "ebm_prefilter_topm_seed": int(topm_seed),
-            "ebm_prefilter_topm_fill": int(topm_fill),
+            "energy_mode": str(energy_mode),
             "infer_exit_code": int(rc_infer),
             "eval_exit_code": int(rc_eval),
             "P": 0.0,
@@ -332,6 +454,36 @@ def main() -> None:
             "infer_summary": infer_summary,
             "eval_summary": eval_summary,
         }
+        if is_four_term:
+            row.update(
+                {
+                    "ebm_energy_prob_gate": float(energy_prob_gate),
+                    "ebm_energy_select_margin": float(energy_margin),
+                    "ebm_w_pair": float(w_pair),
+                    "nms_thr": float(nms_thr),
+                    "ebm_prefilter_topm_seed": int(topm_seed),
+                    "ebm_prefilter_topm_fill": int(topm_fill),
+                    "ebm_temporal_pair_bonus": float(temporal_bonus),
+                    "ebm_overlap_soft_scale": float(overlap_scale),
+                    "ebm_context_shortfall_penalty": float(context_penalty),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "seed_keep_thr": float(seed_keep),
+                    "fill_keep_thr": float(fill_keep),
+                    "min_dt_support": int(min_dt),
+                    "min_dist_to_seed": float(min_dist),
+                    "max_fill": int(max_fill),
+                    "nms_thr": float(nms_thr),
+                    "ebm_prefilter_topm_seed": int(topm_seed),
+                    "ebm_prefilter_topm_fill": int(topm_fill),
+                    "ebm_temporal_pair_bonus": float(temporal_bonus),
+                    "ebm_overlap_soft_scale": float(overlap_scale),
+                    "ebm_context_shortfall_penalty": float(context_penalty),
+                }
+            )
 
         if metrics is not None:
             row.update(metrics)

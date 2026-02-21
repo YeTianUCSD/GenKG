@@ -80,6 +80,21 @@ def _add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, hel
     parser.set_defaults(**{name: default})
 
 
+def _load_ckpt_threshold(ckpt_path: str, field_name: str = "best_threshold") -> Optional[float]:
+    try:
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        v = obj.get(str(field_name), None)
+        if v is None:
+            return None
+        x = float(v)
+        if not (x == x):  # NaN
+            return None
+        return float(max(0.0, min(1.0, x)))
+    except Exception:
+        return None
+
+
 def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run ebm_genkg inference and write det_refined.")
 
@@ -123,11 +138,105 @@ def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     # EBM kwargs (packed into InferConfig.ebm_kwargs)
     p.add_argument("--ebm_prefilter_topm_seed", type=int, default=int(cfg.get("ebm_prefilter_topm_seed", 800)))
     p.add_argument("--ebm_prefilter_topm_fill", type=int, default=int(cfg.get("ebm_prefilter_topm_fill", 1200)))
+    p.add_argument(
+        "--ebm_energy_mode",
+        type=str,
+        default=str(cfg.get("ebm_energy_mode", "four_term")),
+        choices=["four_term", "legacy"],
+    )
+    p.add_argument("--ebm_energy_select_margin", type=float, default=float(cfg.get("ebm_energy_select_margin", 0.0)))
+    p.add_argument("--ebm_energy_prob_gate", type=float, default=float(cfg.get("ebm_energy_prob_gate", 0.0)))
+    _add_bool_arg(
+        p,
+        "ebm_energy_local_refine",
+        bool(cfg.get("ebm_energy_local_refine", True)),
+        "Enable local remove/add refinement for four_term energy solve",
+    )
+    p.add_argument(
+        "--ebm_energy_local_refine_rounds",
+        type=int,
+        default=int(cfg.get("ebm_energy_local_refine_rounds", 2)),
+    )
+    p.add_argument("--ebm_w_keep", type=float, default=float(cfg.get("ebm_w_keep", 1.0)))
+    p.add_argument("--ebm_w_pair", type=float, default=float(cfg.get("ebm_w_pair", 1.0)))
+    _add_bool_arg(
+        p,
+        "ebm_enable_learned_pair",
+        bool(cfg.get("ebm_enable_learned_pair", True)),
+        "Enable learned pair-energy term from structured energy checkpoint",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_hard_nms",
+        bool(cfg.get("ebm_hard_nms", False)),
+        "Use hard NMS conflict in pair energy",
+    )
     _add_bool_arg(p, "ebm_enable_label_vote", bool(cfg.get("ebm_enable_label_vote", False)), "Enable label vote in EBM")
     p.add_argument("--ebm_w_attr", type=float, default=float(cfg.get("ebm_w_attr", 0.0)))
+    _add_bool_arg(
+        p,
+        "ebm_enable_overlap_soft",
+        bool(cfg.get("ebm_enable_overlap_soft", True)),
+        "Enable soft overlap penalty term in EBM pair energy",
+    )
+    p.add_argument("--ebm_overlap_min_ratio", type=float, default=float(cfg.get("ebm_overlap_min_ratio", 0.10)))
+    p.add_argument("--ebm_overlap_soft_scale", type=float, default=float(cfg.get("ebm_overlap_soft_scale", 1.00)))
+    _add_bool_arg(
+        p,
+        "ebm_enable_temporal_pair",
+        bool(cfg.get("ebm_enable_temporal_pair", True)),
+        "Enable temporal pair consistency bonus term in EBM pair energy",
+    )
+    p.add_argument("--ebm_temporal_pair_radius", type=float, default=float(cfg.get("ebm_temporal_pair_radius", 1.5)))
+    p.add_argument("--ebm_temporal_pair_bonus", type=float, default=float(cfg.get("ebm_temporal_pair_bonus", 0.30)))
+    _add_bool_arg(
+        p,
+        "ebm_temporal_pair_warp_only",
+        bool(cfg.get("ebm_temporal_pair_warp_only", True)),
+        "Apply temporal pair bonus only when at least one candidate is warp",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_soft_dt_support",
+        bool(cfg.get("ebm_soft_dt_support", True)),
+        "Use soft relation-energy penalty for dt support shortfall instead of hard filter",
+    )
+    p.add_argument(
+        "--ebm_dt_shortfall_penalty",
+        type=float,
+        default=float(cfg.get("ebm_dt_shortfall_penalty", 0.35)),
+        help="Energy penalty per unit dt-support shortfall when ebm_soft_dt_support is enabled.",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_enable_context_density",
+        bool(cfg.get("ebm_enable_context_density", True)),
+        "Enable context-density unary relation energy term",
+    )
+    p.add_argument("--ebm_context_cell_xy", type=float, default=float(cfg.get("ebm_context_cell_xy", 1.0)))
+    p.add_argument("--ebm_context_min_density", type=int, default=int(cfg.get("ebm_context_min_density", 2)))
+    p.add_argument("--ebm_context_shortfall_penalty", type=float, default=float(cfg.get("ebm_context_shortfall_penalty", 0.15)))
+    _add_bool_arg(
+        p,
+        "ebm_context_warp_only",
+        bool(cfg.get("ebm_context_warp_only", True)),
+        "Apply context-density penalty only to warp candidates",
+    )
     p.add_argument("--ebm_unary_ckpt_path", type=str, default=cfg.get("ebm_unary_ckpt_path"))
     _add_bool_arg(p, "ebm_unary_use_learned", bool(cfg.get("ebm_unary_use_learned", True)),
                   "Use learned unary ckpt in EBM when provided")
+    _add_bool_arg(
+        p,
+        "ebm_auto_threshold_from_ckpt",
+        bool(cfg.get("ebm_auto_threshold_from_ckpt", True)),
+        "Auto align keep/seed thresholds with unary ckpt best_threshold",
+    )
+    p.add_argument(
+        "--ebm_ckpt_threshold_field",
+        type=str,
+        default=str(cfg.get("ebm_ckpt_threshold_field", "best_threshold")),
+        help="Field name in unary ckpt used for auto threshold alignment.",
+    )
 
     # writeback
     p.add_argument("--write_mode", type=str, default=str(cfg.get("write_mode", "add")), choices=["add", "replace"])
@@ -160,6 +269,56 @@ def main() -> None:
     cfg = _load_cfg(a0.config)
     parser = _make_parser(cfg)
     args = parser.parse_args()
+    auto_thr_info: Dict[str, Any] = {
+        "enabled": bool(args.ebm_auto_threshold_from_ckpt),
+        "applied": False,
+        "threshold": None,
+        "ckpt_path": str(args.ebm_unary_ckpt_path) if args.ebm_unary_ckpt_path else None,
+        "field": str(args.ebm_ckpt_threshold_field),
+    }
+
+    if (
+        str(args.backend) == "ebm"
+        and bool(args.ebm_unary_use_learned)
+        and bool(args.ebm_auto_threshold_from_ckpt)
+        and args.ebm_unary_ckpt_path
+    ):
+        thr = _load_ckpt_threshold(str(args.ebm_unary_ckpt_path), field_name=str(args.ebm_ckpt_threshold_field))
+        if thr is not None:
+            old_keep = float(args.keep_thr)
+            old_seed = float(args.seed_keep_thr)
+            old_fill = float(args.fill_keep_thr)
+
+            args.keep_thr = float(thr)
+            if bool(args.two_stage):
+                args.seed_keep_thr = float(thr)
+                # Keep fill threshold no stricter than seed by default.
+                if float(args.fill_keep_thr) > float(args.seed_keep_thr):
+                    args.fill_keep_thr = float(args.seed_keep_thr)
+
+            auto_thr_info.update(
+                {
+                    "applied": True,
+                    "threshold": float(thr),
+                    "old_keep_thr": old_keep,
+                    "old_seed_keep_thr": old_seed,
+                    "old_fill_keep_thr": old_fill,
+                    "new_keep_thr": float(args.keep_thr),
+                    "new_seed_keep_thr": float(args.seed_keep_thr),
+                    "new_fill_keep_thr": float(args.fill_keep_thr),
+                }
+            )
+            print(
+                "[auto-thr] applied from ckpt: "
+                f"keep_thr {old_keep:.3f}->{float(args.keep_thr):.3f}, "
+                f"seed_keep_thr {old_seed:.3f}->{float(args.seed_keep_thr):.3f}, "
+                f"fill_keep_thr {old_fill:.3f}->{float(args.fill_keep_thr):.3f}"
+            )
+        else:
+            print(
+                "[auto-thr] skipped: cannot load threshold "
+                f"'{args.ebm_ckpt_threshold_field}' from {args.ebm_unary_ckpt_path}"
+            )
 
     ignore = _parse_ignore(args.ignore_classes)
 
@@ -204,10 +363,33 @@ def main() -> None:
     ebm_kwargs = dict(cfg.get("ebm_kwargs", {}) if isinstance(cfg.get("ebm_kwargs", {}), dict) else {})
     ebm_kwargs.update(
         {
+            "energy_mode": str(args.ebm_energy_mode),
+            "energy_select_margin": float(args.ebm_energy_select_margin),
+            "energy_prob_gate": float(args.ebm_energy_prob_gate),
+            "energy_local_refine": bool(args.ebm_energy_local_refine),
+            "energy_local_refine_rounds": int(args.ebm_energy_local_refine_rounds),
+            "w_keep": float(args.ebm_w_keep),
+            "w_pair": float(args.ebm_w_pair),
+            "enable_learned_pair": bool(args.ebm_enable_learned_pair),
+            "hard_nms": bool(args.ebm_hard_nms),
             "prefilter_topm_seed": int(args.ebm_prefilter_topm_seed),
             "prefilter_topm_fill": int(args.ebm_prefilter_topm_fill),
             "enable_label_vote": bool(args.ebm_enable_label_vote),
             "w_attr": float(args.ebm_w_attr),
+            "enable_overlap_soft": bool(args.ebm_enable_overlap_soft),
+            "overlap_min_ratio": float(args.ebm_overlap_min_ratio),
+            "overlap_soft_scale": float(args.ebm_overlap_soft_scale),
+            "enable_temporal_pair": bool(args.ebm_enable_temporal_pair),
+            "temporal_pair_radius": float(args.ebm_temporal_pair_radius),
+            "temporal_pair_bonus": float(args.ebm_temporal_pair_bonus),
+            "temporal_pair_warp_only": bool(args.ebm_temporal_pair_warp_only),
+            "soft_dt_support": bool(args.ebm_soft_dt_support),
+            "dt_shortfall_penalty": float(args.ebm_dt_shortfall_penalty),
+            "enable_context_density": bool(args.ebm_enable_context_density),
+            "context_cell_xy": float(args.ebm_context_cell_xy),
+            "context_min_density": int(args.ebm_context_min_density),
+            "context_shortfall_penalty": float(args.ebm_context_shortfall_penalty),
+            "context_warp_only": bool(args.ebm_context_warp_only),
             "unary_use_learned": bool(args.ebm_unary_use_learned),
             "unary_ckpt_path": (str(args.ebm_unary_ckpt_path) if args.ebm_unary_ckpt_path else None),
         }
@@ -309,6 +491,7 @@ def main() -> None:
                 "total": float(time.time() - t0),
             },
             "ckpt_path": str(args.ckpt_path) if args.ckpt_path else None,
+            "auto_threshold_from_ckpt": auto_thr_info,
             "args": vars(args),
         }
         dump_json(summary, args.summary_json, indent=2)

@@ -12,7 +12,7 @@ require_gt: false
 # candidate building
 use_warp: true
 warp_radius: 2
-warp_topk: 120
+warp_topk: 200
 warp_decay: 0.9
 raw_score_min: 0.05
 max_per_frame: 180
@@ -26,8 +26,39 @@ nms_thr: 1.5
 topk: 200
 include_sources: false
 
-# two-stage fill
-two_stage: true
+# ebm runtime kwargs (active in four_term mode)
+ebm_energy_mode: four_term
+ebm_energy_select_margin: 0.0
+ebm_energy_prob_gate: 0.0
+ebm_energy_local_refine: true
+ebm_energy_local_refine_rounds: 2
+ebm_w_keep: 1.0
+ebm_w_pair: 1.0
+ebm_enable_learned_pair: true
+ebm_hard_nms: false
+ebm_prefilter_topm_seed: 500
+ebm_prefilter_topm_fill: 700
+ebm_enable_label_vote: false
+ebm_w_attr: 0.0
+ebm_enable_overlap_soft: true
+ebm_overlap_min_ratio: 0.10
+ebm_overlap_soft_scale: 1.00
+ebm_enable_temporal_pair: true
+ebm_temporal_pair_radius: 1.5
+ebm_temporal_pair_bonus: 0.30
+ebm_temporal_pair_warp_only: true
+ebm_soft_dt_support: true
+ebm_dt_shortfall_penalty: 0.35
+ebm_enable_context_density: true
+ebm_context_cell_xy: 1.0
+ebm_context_min_density: 2
+ebm_context_shortfall_penalty: 0.15
+ebm_context_warp_only: true
+ebm_unary_use_learned: true
+ebm_unary_ckpt_path: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/train_20260211-084007/checkpoints/unary_logreg.json
+
+# two-stage fill (legacy path; currently disabled)
+two_stage: false
 seed_keep_thr: 0.50
 seed_sources: raw
 fill_keep_thr: 0.35
@@ -35,14 +66,6 @@ min_dt_support: 2
 dt_cell_size: 1.0
 min_dist_to_seed: 0.8
 max_fill: 220
-
-# ebm runtime kwargs
-ebm_prefilter_topm_seed: 500
-ebm_prefilter_topm_fill: 700
-ebm_enable_label_vote: false
-ebm_w_attr: 0.0
-ebm_unary_use_learned: true
-ebm_unary_ckpt_path: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/train_20260211-084007/checkpoints/unary_logreg.json
 
 # writeback
 write_mode: add

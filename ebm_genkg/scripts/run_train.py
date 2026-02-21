@@ -3,25 +3,25 @@
 
 """
 One-command training pipeline:
-  build_trainset.py -> train_unary.py
+  build_trainset.py -> train_unary.py / train_energy.py / train_energy_structured.py
 and archive artifacts under experiments/<run_id>/.
 
 Artifacts per run:
 - config/trainset_config.(yaml|json)
-- config/train_unary_config.(yaml|json)
+- config/train_config.(yaml|json)
 - config/infer_config.(yaml|json)                (optional, when eval_after_train)
 - config/eval_config.(yaml|json)                 (optional, when eval_after_train)
 - logs/build_trainset.log
-- logs/train_unary.log
+- logs/train_unary.log / logs/train_energy.log
 - logs/infer.log                                 (optional)
 - logs/eval.log                                  (optional)
 - logs/tune_infer.log                            (optional)
 - metrics/trainset.meta.json
-- metrics/train_unary.summary.json
+- metrics/train_unary.summary.json / metrics/train_energy.summary.json
 - metrics/infer_summary.json                     (optional)
 - metrics/eval_summary.json                      (optional)
 - metrics/tune_infer.summary.json                (optional)
-- checkpoints/unary_logreg.json
+- checkpoints/unary_logreg.json / checkpoints/energy_logreg.json
 - artifacts/out_refined.json                     (optional)
 - tuning/trials/*                                (optional)
 - manifest.json
@@ -29,7 +29,8 @@ Artifacts per run:
 Example:
   python scripts/run_train.py \
     --trainset_config configs/trainset.yaml \
-    --train_unary_config configs/train_unary.yaml
+    --train_config configs/train_energy.yaml \
+    --train_mode energy
 """
 
 from __future__ import annotations
@@ -112,9 +113,14 @@ def _run_and_tee(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run build_trainset + train_unary and archive artifacts.")
+    ap = argparse.ArgumentParser(description="Run build_trainset + train_unary/train_energy and archive artifacts.")
     ap.add_argument("--trainset_config", type=str, required=True, help="Path to trainset config (yaml/json)")
-    ap.add_argument("--train_unary_config", type=str, required=True, help="Path to train_unary config (yaml/json)")
+    ap.add_argument("--train_config", type=str, default=None,
+                    help="Path to train config (yaml/json). Use with --train_mode unary|energy.")
+    ap.add_argument("--train_unary_config", type=str, default=None,
+                    help="Deprecated alias of --train_config. Kept for compatibility.")
+    ap.add_argument("--train_mode", type=str, default="energy", choices=["unary", "energy", "energy_structured"],
+                    help="Training mode. 'energy_structured' uses scripts/train_energy_structured.py.")
 
     ap.add_argument("--run_name", type=str, default=None,
                     help="Optional run folder name. Default: train_<timestamp>")
@@ -147,6 +153,15 @@ def main() -> None:
     ap.add_argument("--skip_train", action="store_true", help="Only run dataset build stage")
     args = ap.parse_args()
 
+    # Backward-compatible config resolution
+    if args.train_config is None and args.train_unary_config is None:
+        raise ValueError("One of --train_config / --train_unary_config is required.")
+    if args.train_config is not None and args.train_unary_config is not None:
+        if os.path.abspath(args.train_config) != os.path.abspath(args.train_unary_config):
+            raise ValueError("Both --train_config and --train_unary_config provided but differ.")
+    resolved_train_cfg = args.train_config if args.train_config is not None else args.train_unary_config
+    assert resolved_train_cfg is not None
+
     if args.eval_after_train and args.skip_train:
         raise ValueError("--eval_after_train requires training. Do not use with --skip_train.")
     if args.eval_after_train and (not args.infer_config or not args.eval_config):
@@ -154,7 +169,7 @@ def main() -> None:
 
     run_id = args.run_name if args.run_name else f"train_{_ts()}"
     exp_dir = os.path.join(args.experiments_root, run_id)
-    pipeline_log = os.path.join(args.experiments_root, f"{run_id}.log")
+    pipeline_log = os.path.join(exp_dir, f"{run_id}.log")
     cfg_dir = os.path.join(exp_dir, "config")
     log_dir = os.path.join(exp_dir, "logs")
     metrics_dir = os.path.join(exp_dir, "metrics")
@@ -173,9 +188,9 @@ def main() -> None:
 
     # Save config snapshots
     trainset_cfg_dst = os.path.join(cfg_dir, os.path.basename(args.trainset_config))
-    train_unary_cfg_dst = os.path.join(cfg_dir, os.path.basename(args.train_unary_config))
+    train_cfg_dst = os.path.join(cfg_dir, os.path.basename(resolved_train_cfg))
     shutil.copy2(args.trainset_config, trainset_cfg_dst)
-    shutil.copy2(args.train_unary_config, train_unary_cfg_dst)
+    shutil.copy2(resolved_train_cfg, train_cfg_dst)
     infer_cfg_dst = None
     eval_cfg_dst = None
     if args.eval_after_train:
@@ -188,6 +203,8 @@ def main() -> None:
     trainset_meta = os.path.join(metrics_dir, "trainset.meta.json")
     unary_ckpt = os.path.join(ckpt_dir, "unary_logreg.json")
     unary_summary = os.path.join(metrics_dir, "train_unary.summary.json")
+    energy_ckpt = os.path.join(ckpt_dir, "energy_logreg.json")
+    energy_summary = os.path.join(metrics_dir, "train_energy.summary.json")
     infer_summary = os.path.join(metrics_dir, "infer_summary.json")
     eval_summary = os.path.join(metrics_dir, "eval_summary.json")
     tune_summary = os.path.join(metrics_dir, "tune_infer.summary.json")
@@ -222,29 +239,47 @@ def main() -> None:
     )
 
     train_rc: Optional[int] = None
+    if args.train_mode == "unary":
+        train_script = "train_unary.py"
+        train_ckpt = unary_ckpt
+        train_summary = unary_summary
+        train_log_name = "train_unary.log"
+        train_stage_name = "train_unary"
+    elif args.train_mode == "energy":
+        train_script = "train_energy.py"
+        train_ckpt = energy_ckpt
+        train_summary = energy_summary
+        train_log_name = "train_energy.log"
+        train_stage_name = "train_energy"
+    else:
+        train_script = "train_energy_structured.py"
+        train_ckpt = energy_ckpt
+        train_summary = energy_summary
+        train_log_name = "train_energy.log"
+        train_stage_name = "train_energy_structured"
     if build_rc == 0 and not args.skip_train:
         train_cmd: List[str] = [
             py,
-            os.path.join(SCRIPTS_DIR, "train_unary.py"),
+            os.path.join(SCRIPTS_DIR, train_script),
             "--config",
-            args.train_unary_config,
+            resolved_train_cfg,
             "--in_npz",
             trainset_npz,
             "--out_ckpt",
-            unary_ckpt,
+            train_ckpt,
             "--out_summary",
-            unary_summary,
+            train_summary,
         ]
         if args.max_train_rows is not None:
             train_cmd.extend(["--max_train_rows", str(args.max_train_rows)])
 
-        _log("[train_pipeline] train_unary stage...", pipeline_log)
+        _log(f"[train_pipeline] {train_stage_name} stage...", pipeline_log)
         train_rc = _run_and_tee(
             train_cmd,
-            os.path.join(log_dir, "train_unary.log"),
+            os.path.join(log_dir, train_log_name),
             cwd=REPO_ROOT,
             pipeline_log_path=pipeline_log,
-            stage_name="train_unary",
+            stage_name=train_stage_name,
         )
 
     infer_rc: Optional[int] = None
@@ -267,7 +302,7 @@ def main() -> None:
             "--summary_json",
             tune_summary,
             "--ckpt_path",
-            unary_ckpt,
+            train_ckpt,
             "--target_recall",
             str(args.tune_target_recall),
             "--max_trials",
@@ -302,9 +337,9 @@ def main() -> None:
             "--summary_json",
             infer_summary,
             "--ckpt_path",
-            unary_ckpt,
+            train_ckpt,
             "--ebm_unary_ckpt_path",
-            unary_ckpt,
+            train_ckpt,
         ]
         if args.eval_limit_scenes is not None:
             infer_cmd.extend(["--limit_scenes", str(args.eval_limit_scenes)])
@@ -347,9 +382,12 @@ def main() -> None:
         "repo_root": REPO_ROOT,
         "experiments_root": os.path.abspath(args.experiments_root),
         "trainset_config": os.path.abspath(args.trainset_config),
-        "train_unary_config": os.path.abspath(args.train_unary_config),
+        "train_config": os.path.abspath(resolved_train_cfg),
+        "train_unary_config": os.path.abspath(resolved_train_cfg),  # backward-compatible alias
         "trainset_config_snapshot": trainset_cfg_dst,
-        "train_unary_config_snapshot": train_unary_cfg_dst,
+        "train_config_snapshot": train_cfg_dst,
+        "train_unary_config_snapshot": train_cfg_dst,  # backward-compatible alias
+        "train_mode": str(args.train_mode),
         "eval_after_train": bool(args.eval_after_train),
         "infer_config": os.path.abspath(args.infer_config) if args.infer_config else None,
         "eval_config": os.path.abspath(args.eval_config) if args.eval_config else None,
@@ -372,15 +410,19 @@ def main() -> None:
         "eval_exit_code": eval_rc,
         "paths": {
             "build_log": os.path.join(log_dir, "build_trainset.log"),
-            "train_log": os.path.join(log_dir, "train_unary.log"),
+            "train_log": os.path.join(log_dir, train_log_name),
             "tune_log": os.path.join(log_dir, "tune_infer.log"),
             "infer_log": os.path.join(log_dir, "infer.log"),
             "eval_log": os.path.join(log_dir, "eval.log"),
             "pipeline_log": pipeline_log,
             "trainset_npz": trainset_npz,
             "trainset_meta": trainset_meta,
+            "train_ckpt": train_ckpt,
+            "train_summary": train_summary,
             "unary_ckpt": unary_ckpt,
             "unary_summary": unary_summary,
+            "energy_ckpt": energy_ckpt,
+            "energy_summary": energy_summary,
             "tune_summary": tune_summary,
             "tuned_infer_config": tuned_infer_cfg if args.auto_tune_infer else None,
             "infer_config_used_for_eval": os.path.abspath(infer_cfg_for_eval) if args.eval_after_train else None,
