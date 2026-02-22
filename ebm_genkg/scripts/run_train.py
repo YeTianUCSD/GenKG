@@ -208,6 +208,11 @@ def main() -> None:
     ap.add_argument("--eval_limit_scenes", type=int, default=None,
                     help="Optional limit_scenes override for infer/eval stages.")
     ap.add_argument(
+        "--no_sync_train_threshold",
+        action="store_true",
+        help="Do not auto-sync train summary best_threshold into infer config before post-train inference.",
+    )
+    ap.add_argument(
         "--skip_save_out_json",
         action="store_true",
         help="When eval_after_train is enabled, delete large post-train out_refined.json after eval.",
@@ -403,23 +408,26 @@ def main() -> None:
             infer_cfg_for_eval = tuned_infer_cfg
 
     if args.eval_after_train and build_rc == 0 and train_rc == 0 and (tune_rc in (None, 0)):
-        best_thr = _read_best_threshold(train_summary)
-        if best_thr is not None and infer_cfg_for_eval is not None:
-            infer_ext = os.path.splitext(infer_cfg_for_eval)[1] or ".yaml"
-            infer_cfg_synced = os.path.join(cfg_dir, f"infer.synced_thr{infer_ext}")
-            try:
-                infer_cfg_for_eval = _sync_best_threshold_to_infer_config(
-                    src_cfg_path=infer_cfg_for_eval,
-                    dst_cfg_path=infer_cfg_synced,
-                    best_thr=float(best_thr),
-                )
-                best_thr_synced = float(best_thr)
-                _log(
-                    f"[train_pipeline] synced best_threshold={best_thr_synced:.4f} -> {infer_cfg_for_eval}",
-                    pipeline_log,
-                )
-            except Exception as e:
-                _log(f"[train_pipeline] warning: failed to sync best threshold into infer config: {repr(e)}", pipeline_log)
+        if not bool(args.no_sync_train_threshold):
+            best_thr = _read_best_threshold(train_summary)
+            if best_thr is not None and infer_cfg_for_eval is not None:
+                infer_ext = os.path.splitext(infer_cfg_for_eval)[1] or ".yaml"
+                infer_cfg_synced = os.path.join(cfg_dir, f"infer.synced_thr{infer_ext}")
+                try:
+                    infer_cfg_for_eval = _sync_best_threshold_to_infer_config(
+                        src_cfg_path=infer_cfg_for_eval,
+                        dst_cfg_path=infer_cfg_synced,
+                        best_thr=float(best_thr),
+                    )
+                    best_thr_synced = float(best_thr)
+                    _log(
+                        f"[train_pipeline] synced best_threshold={best_thr_synced:.4f} -> {infer_cfg_for_eval}",
+                        pipeline_log,
+                    )
+                except Exception as e:
+                    _log(f"[train_pipeline] warning: failed to sync best threshold into infer config: {repr(e)}", pipeline_log)
+        else:
+            _log("[train_pipeline] skip threshold sync: using infer config thresholds as-is.", pipeline_log)
 
         infer_cmd: List[str] = [
             py,
@@ -503,6 +511,7 @@ def main() -> None:
             "tune_max_trials": int(args.tune_max_trials),
             "tune_seed": int(args.tune_seed),
             "tune_search_profile": str(args.tune_search_profile),
+            "no_sync_train_threshold": bool(args.no_sync_train_threshold),
         },
         "build_exit_code": build_rc,
         "train_exit_code": train_rc,

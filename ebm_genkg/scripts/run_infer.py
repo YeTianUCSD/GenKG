@@ -338,6 +338,42 @@ def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     p.add_argument("--ebm_stage_c_rel_scale", type=float, default=float(cfg.get("ebm_stage_c_rel_scale", 0.20)))
     _add_bool_arg(
         p,
+        "ebm_recall_backfill_enabled",
+        bool(cfg.get("ebm_recall_backfill_enabled", True)),
+        "Enable recall-oriented backfill after EBM energy solve.",
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_min_keep_prob",
+        type=float,
+        default=float(cfg.get("ebm_recall_backfill_min_keep_prob", 0.15)),
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_min_per_frame",
+        type=int,
+        default=int(cfg.get("ebm_recall_backfill_min_per_frame", 120)),
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_raw_ratio",
+        type=float,
+        default=float(cfg.get("ebm_recall_backfill_raw_ratio", 0.75)),
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_pair_guard_scale",
+        type=float,
+        default=float(cfg.get("ebm_recall_backfill_pair_guard_scale", 0.50)),
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_min_class_conf",
+        type=float,
+        default=float(cfg.get("ebm_recall_backfill_min_class_conf", 0.65)),
+    )
+    p.add_argument(
+        "--ebm_recall_backfill_min_support",
+        type=int,
+        default=int(cfg.get("ebm_recall_backfill_min_support", 2)),
+    )
+    _add_bool_arg(
+        p,
         "ebm_auto_threshold_from_ckpt",
         bool(cfg.get("ebm_auto_threshold_from_ckpt", True)),
         "Auto align keep/seed thresholds with unary ckpt best_threshold",
@@ -442,6 +478,37 @@ def main() -> None:
         args.ebm_unary_ckpt_path = str(args.ckpt_path)
         auto_thr_info["ckpt_path"] = str(args.ebm_unary_ckpt_path)
         print(f"[ckpt-fallback] use --ckpt_path as ebm_unary_ckpt_path: {args.ebm_unary_ckpt_path}")
+        # If auto-threshold was enabled but skipped earlier due missing unary ckpt path,
+        # re-try threshold alignment after fallback.
+        if bool(args.ebm_auto_threshold_from_ckpt):
+            thr = _load_ckpt_threshold(str(args.ebm_unary_ckpt_path), field_name=str(args.ebm_ckpt_threshold_field))
+            if thr is not None:
+                old_keep = float(args.keep_thr)
+                old_seed = float(args.seed_keep_thr)
+                old_fill = float(args.fill_keep_thr)
+                args.keep_thr = float(thr)
+                if bool(args.two_stage):
+                    args.seed_keep_thr = float(thr)
+                    if float(args.fill_keep_thr) > float(args.seed_keep_thr):
+                        args.fill_keep_thr = float(args.seed_keep_thr)
+                auto_thr_info.update(
+                    {
+                        "applied": True,
+                        "threshold": float(thr),
+                        "old_keep_thr": old_keep,
+                        "old_seed_keep_thr": old_seed,
+                        "old_fill_keep_thr": old_fill,
+                        "new_keep_thr": float(args.keep_thr),
+                        "new_seed_keep_thr": float(args.seed_keep_thr),
+                        "new_fill_keep_thr": float(args.fill_keep_thr),
+                    }
+                )
+                print(
+                    "[auto-thr] applied from fallback ckpt: "
+                    f"keep_thr {old_keep:.3f}->{float(args.keep_thr):.3f}, "
+                    f"seed_keep_thr {old_seed:.3f}->{float(args.seed_keep_thr):.3f}, "
+                    f"fill_keep_thr {old_fill:.3f}->{float(args.fill_keep_thr):.3f}"
+                )
 
     ignore = _parse_ignore(args.ignore_classes)
 
@@ -531,6 +598,13 @@ def main() -> None:
             "stage_b_enforce_class_conf": bool(args.ebm_stage_b_enforce_class_conf),
             "stage_c_attr_scale": float(args.ebm_stage_c_attr_scale),
             "stage_c_rel_scale": float(args.ebm_stage_c_rel_scale),
+            "recall_backfill_enabled": bool(args.ebm_recall_backfill_enabled),
+            "recall_backfill_min_keep_prob": float(args.ebm_recall_backfill_min_keep_prob),
+            "recall_backfill_min_per_frame": int(args.ebm_recall_backfill_min_per_frame),
+            "recall_backfill_raw_ratio": float(args.ebm_recall_backfill_raw_ratio),
+            "recall_backfill_pair_guard_scale": float(args.ebm_recall_backfill_pair_guard_scale),
+            "recall_backfill_min_class_conf": float(args.ebm_recall_backfill_min_class_conf),
+            "recall_backfill_min_support": int(args.ebm_recall_backfill_min_support),
         }
     )
 

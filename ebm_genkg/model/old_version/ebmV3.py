@@ -264,15 +264,6 @@ class EBMConfig:
     stage_b_enforce_class_conf: bool = False
     stage_c_attr_scale: float = 0.20
     stage_c_rel_scale: float = 0.20
-    # recall-oriented backfill after energy solve:
-    # add high-keep candidates with weak conflict guard until a target budget is reached.
-    recall_backfill_enabled: bool = True
-    recall_backfill_min_keep_prob: float = 0.15
-    recall_backfill_min_per_frame: int = 120
-    recall_backfill_raw_ratio: float = 0.75
-    recall_backfill_pair_guard_scale: float = 0.50
-    recall_backfill_min_class_conf: float = 0.65
-    recall_backfill_min_support: int = 2
 
     # learned unary model (optional)
     unary_use_learned: bool = True
@@ -1732,64 +1723,6 @@ def solve_candidates(
             select_margin=0.0,
         )
 
-    # Recall backfill on top of energy solve (mainly for four_term mode):
-    # when selection is too small, add high-keep leftovers with weak conflict checks.
-    backfill_added = 0
-    if mode == "four_term" and bool(getattr(cfg, "recall_backfill_enabled", True)):
-        topk_eff = int(cfg.topk) if cfg.topk is not None else int(N)
-        raw_count = int(sum(1 for c in cands if _source_group(c) == "raw"))
-        tgt_min = int(max(0, getattr(cfg, "recall_backfill_min_per_frame", 120)))
-        tgt_raw = int(round(float(max(0, raw_count)) * float(max(0.0, getattr(cfg, "recall_backfill_raw_ratio", 0.75)))))
-        target_count = int(min(topk_eff, max(tgt_min, tgt_raw)))
-        need = int(max(0, target_count - len(selected_idx)))
-        if need > 0:
-            pmin = float(np.clip(getattr(cfg, "recall_backfill_min_keep_prob", 0.15), 0.0, 1.0))
-            cmin = float(np.clip(getattr(cfg, "recall_backfill_min_class_conf", 0.0), 0.0, 1.0))
-            smin = int(max(0, getattr(cfg, "recall_backfill_min_support", 0)))
-            sel_set = set(int(i) for i in selected_idx)
-            pool = [
-                int(i)
-                for i in np.argsort(-keep_probs).tolist()
-                if (
-                    int(i) not in sel_set
-                    and float(keep_probs[int(i)]) >= pmin
-                    and float(class_conf_arr[int(i)]) >= cmin
-                    and int(support_vals[int(i)]) >= smin
-                )
-            ]
-            guard_thr = float(max(0.2, float(cfg.nms_thr_xy) * float(max(0.0, getattr(cfg, "recall_backfill_pair_guard_scale", 0.50)))))
-            guard_thr2 = guard_thr * guard_thr
-            class_counts: Dict[int, int] = {}
-            if cfg.max_per_class is not None:
-                for j in selected_idx:
-                    lj = int(getattr(cands[j], "label", -1))
-                    class_counts[lj] = class_counts.get(lj, 0) + 1
-            for i in pool:
-                if backfill_added >= need:
-                    break
-                ci = cands[i]
-                li = int(getattr(ci, "label", -1))
-                if cfg.max_per_class is not None and class_counts.get(li, 0) >= int(cfg.max_per_class):
-                    continue
-                xi, yi = _cand_xy(ci)
-                conflict = False
-                for j in selected_idx:
-                    cj = cands[j]
-                    if (not cfg.nms_cross_class) and (int(getattr(cj, "label", -1)) != li):
-                        continue
-                    xj, yj = _cand_xy(cj)
-                    d2 = (xi - xj) ** 2 + (yi - yj) ** 2
-                    if d2 <= guard_thr2:
-                        conflict = True
-                        break
-                if conflict:
-                    continue
-                selected_idx.append(i)
-                sel_set.add(i)
-                backfill_added += 1
-                if cfg.max_per_class is not None:
-                    class_counts[li] = class_counts.get(li, 0) + 1
-
     # final topk guard (global)
     if cfg.topk is not None and len(selected_idx) > int(cfg.topk):
         selected_idx = sorted(selected_idx, key=lambda i: float(keep_logits[i]), reverse=True)[: int(cfg.topk)]
@@ -1813,14 +1746,6 @@ def solve_candidates(
         dbg["energy_local_refine"] = False
         dbg["energy_local_refine_rounds"] = 0
         dbg["selected_before_local_refine"] = int(selected_before_refine)
-        dbg["recall_backfill_added"] = int(backfill_added)
-        dbg["recall_backfill_enabled"] = bool(getattr(cfg, "recall_backfill_enabled", True))
-        dbg["recall_backfill_min_keep_prob"] = float(getattr(cfg, "recall_backfill_min_keep_prob", 0.15))
-        dbg["recall_backfill_min_per_frame"] = int(getattr(cfg, "recall_backfill_min_per_frame", 120))
-        dbg["recall_backfill_raw_ratio"] = float(getattr(cfg, "recall_backfill_raw_ratio", 0.75))
-        dbg["recall_backfill_pair_guard_scale"] = float(getattr(cfg, "recall_backfill_pair_guard_scale", 0.50))
-        dbg["recall_backfill_min_class_conf"] = float(getattr(cfg, "recall_backfill_min_class_conf", 0.65))
-        dbg["recall_backfill_min_support"] = int(getattr(cfg, "recall_backfill_min_support", 2))
         dbg["dual_head_solver"] = bool(getattr(cfg, "dual_head_solver", True))
         dbg.update(dbg_dual)
     # Internal cache for ebm_infer_candidates to avoid recomputing keep/attr stats.

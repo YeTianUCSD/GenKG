@@ -21,19 +21,19 @@ ignore_classes: "-1"
 # inference backend
 backend: ebm
 use_sources: all
-keep_thr: 0.25
-nms_thr: 1.2
-topk: 260
+keep_thr: 0.50
+nms_thr: 1.5
+topk: 200
 include_sources: true
 
 # ebm runtime kwargs (active in four_term mode)
 ebm_energy_mode: four_term
-ebm_energy_select_margin: 0.10
+ebm_energy_select_margin: 0.0
 ebm_energy_prob_gate: 0.0
 ebm_energy_local_refine: true
 ebm_energy_local_refine_rounds: 2
 ebm_w_keep: 1.0
-ebm_w_pair: 0.70
+ebm_w_pair: 1.0
 ebm_enable_learned_pair: true
 ebm_hard_nms: false
 ebm_prefilter_topm_seed: 500
@@ -42,17 +42,17 @@ ebm_enable_label_vote: false
 ebm_w_attr: 0.02
 ebm_enable_overlap_soft: true
 ebm_overlap_min_ratio: 0.10
-ebm_overlap_soft_scale: 0.60
+ebm_overlap_soft_scale: 1.00
 ebm_enable_temporal_pair: true
 ebm_temporal_pair_radius: 1.5
 ebm_temporal_pair_bonus: 0.30
 ebm_temporal_pair_warp_only: true
 ebm_soft_dt_support: true
-ebm_dt_shortfall_penalty: 0.05
+ebm_dt_shortfall_penalty: 0.12
 ebm_enable_context_density: true
 ebm_context_cell_xy: 1.0
 ebm_context_min_density: 2
-ebm_context_shortfall_penalty: 0.03
+ebm_context_shortfall_penalty: 0.08
 ebm_context_warp_only: true
 ebm_unary_use_learned: true
 # Do not hardcode old experiment ckpt here.
@@ -71,28 +71,20 @@ ebm_add_head_nonwarp_bias: -3.0
 ebm_add_head_support_gain: 0.20
 ebm_add_head_potential_gain: 0.35
 ebm_add_head_class_gain: 0.25
-ebm_stage_a_keep_thr: 0.25
+ebm_stage_a_keep_thr: 0.50
 ebm_stage_b_add_thr: 0.30
 ebm_stage_b_min_potential_dist: 1.2
 ebm_stage_b_min_potential: 0.25
-ebm_stage_b_min_class_conf: 0.70
-ebm_stage_b_enforce_class_conf: true
+ebm_stage_b_min_class_conf: 0.55
+ebm_stage_b_enforce_class_conf: false
 ebm_stage_c_attr_scale: 0.20
 ebm_stage_c_rel_scale: 0.20
-ebm_recall_backfill_enabled: true
-ebm_recall_backfill_min_keep_prob: 0.35
-ebm_recall_backfill_min_per_frame: 40
-ebm_recall_backfill_raw_ratio: 0.25
-ebm_recall_backfill_pair_guard_scale: 0.90
-ebm_recall_backfill_min_class_conf: 0.65
-ebm_recall_backfill_min_support: 2
-ebm_auto_threshold_from_ckpt: false
 
 # two-stage fill (legacy path; currently disabled)
 two_stage: false
-seed_keep_thr: 0.25
+seed_keep_thr: 0.50
 seed_sources: raw
-fill_keep_thr: 0.25
+fill_keep_thr: 0.35
 min_dt_support: 2
 dt_cell_size: 1.0
 min_dist_to_seed: 0.8
