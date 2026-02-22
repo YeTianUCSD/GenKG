@@ -626,3 +626,160 @@ def format_metrics(m: DetMetrics) -> str:
         f"attr_acc(TP-only)={m.attr_acc:.4f} attr_macroF1={m.attr_macro_f1:.4f} "
         f"(tp_with_attr={m.attr_num_tp_with_attr})"
     )
+
+
+def _bucket_index(v: float, bins: Sequence[float]) -> int:
+    x = float(v)
+    for i, b in enumerate(bins):
+        if x < float(b):
+            return int(i)
+    return int(len(bins))
+
+
+def _bucket_name(i: int, bins: Sequence[float]) -> str:
+    if i < len(bins):
+        if i == 0:
+            return f"[0,{float(bins[i]):.2f})"
+        return f"[{float(bins[i-1]):.2f},{float(bins[i]):.2f})"
+    if len(bins) == 0:
+        return "[0,inf)"
+    return f"[{float(bins[-1]):.2f},inf)"
+
+
+def _safe_metric_dict(tp: int, fp: int, fn: int) -> Dict[str, float]:
+    P = _safe_div(tp, tp + fp)
+    R = _safe_div(tp, tp + fn)
+    F1 = _safe_div(2 * P * R, P + R) if (P + R) > 0 else 0.0
+    return {"tp": int(tp), "fp": int(fp), "fn": int(fn), "P": float(P), "R": float(R), "F1": float(F1)}
+
+
+def evaluate_samples_detailed(
+    samples: List[Dict[str, Any]],
+    *,
+    det_field: str = "det",
+    match_thr_xy: float = 2.0,
+    ignore_classes: Optional[Set[int]] = None,
+    attr_vocab: Optional[Dict[str, int]] = None,
+    pred_attr_field: Optional[str] = None,
+    distance_bins: Optional[Sequence[float]] = None,
+    speed_bins: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Extended evaluation with per-class and distance/speed bucket stats.
+    """
+    dist_bins = list(distance_bins) if distance_bins is not None else [20.0, 40.0, 60.0]
+    speed_bins = list(speed_bins) if speed_bins is not None else [0.2, 2.0, 6.0]
+    dist_bins = sorted([float(x) for x in dist_bins])
+    speed_bins = sorted([float(x) for x in speed_bins])
+
+    m = evaluate_samples(
+        samples,
+        det_field=det_field,
+        match_thr_xy=match_thr_xy,
+        ignore_classes=ignore_classes,
+        attr_vocab=attr_vocab,
+        pred_attr_field=pred_attr_field,
+    )
+
+    ignore = set(ignore_classes or [])
+    cls_cnt: Dict[int, Dict[str, int]] = {}
+    dist_cnt: List[Dict[str, int]] = [{"tp": 0, "fp": 0, "fn": 0} for _ in range(len(dist_bins) + 1)]
+    speed_cnt: List[Dict[str, int]] = [{"tp": 0, "fp": 0, "fn": 0} for _ in range(len(speed_bins) + 1)]
+
+    for s in samples:
+        det_boxes, det_scores, det_labels = parse_det_from_sample(s, det_field=det_field)
+        gt_boxes, gt_labels, _ = parse_gt_from_sample(s)
+        det_boxes, det_labels, det_scores, _ = apply_ignore_classes(det_boxes, det_labels, det_scores, None, ignore)
+        gt_boxes, gt_labels, _, _ = apply_ignore_classes(gt_boxes, gt_labels, None, None, ignore)
+
+        mr = class_aware_greedy_match(
+            det_xyz=det_boxes[:, :3],
+            det_labels=det_labels,
+            gt_xyz=gt_boxes[:, :3],
+            gt_labels=gt_labels,
+            thr_xy=match_thr_xy,
+        )
+
+        matched_gt = set([int(j) for j in mr.det_to_gt.tolist() if int(j) >= 0])
+        for i_det, j_gt in enumerate(mr.det_to_gt.tolist()):
+            lab_det = int(det_labels[i_det]) if i_det < det_labels.shape[0] else -1
+            if lab_det not in cls_cnt:
+                cls_cnt[lab_det] = {"tp": 0, "fp": 0, "fn": 0}
+            if int(j_gt) >= 0:
+                lab_gt = int(gt_labels[int(j_gt)]) if int(j_gt) < gt_labels.shape[0] else lab_det
+                if lab_gt not in cls_cnt:
+                    cls_cnt[lab_gt] = {"tp": 0, "fp": 0, "fn": 0}
+                cls_cnt[lab_gt]["tp"] += 1
+
+                rg = float(np.hypot(float(gt_boxes[int(j_gt), 0]), float(gt_boxes[int(j_gt), 1])))
+                bg = _bucket_index(rg, dist_bins)
+                dist_cnt[bg]["tp"] += 1
+
+                vg = 0.0
+                if gt_boxes.shape[1] >= 9:
+                    vg = float(np.hypot(float(gt_boxes[int(j_gt), 7]), float(gt_boxes[int(j_gt), 8])))
+                sg = _bucket_index(vg, speed_bins)
+                speed_cnt[sg]["tp"] += 1
+            else:
+                cls_cnt[lab_det]["fp"] += 1
+                rd = float(np.hypot(float(det_boxes[i_det, 0]), float(det_boxes[i_det, 1])))
+                bd = _bucket_index(rd, dist_bins)
+                dist_cnt[bd]["fp"] += 1
+                vd = 0.0
+                if det_boxes.shape[1] >= 9:
+                    vd = float(np.hypot(float(det_boxes[i_det, 7]), float(det_boxes[i_det, 8])))
+                sd = _bucket_index(vd, speed_bins)
+                speed_cnt[sd]["fp"] += 1
+
+        for j_gt in range(gt_labels.shape[0]):
+            if int(j_gt) in matched_gt:
+                continue
+            lab_gt = int(gt_labels[j_gt])
+            if lab_gt not in cls_cnt:
+                cls_cnt[lab_gt] = {"tp": 0, "fp": 0, "fn": 0}
+            cls_cnt[lab_gt]["fn"] += 1
+
+            rg = float(np.hypot(float(gt_boxes[j_gt, 0]), float(gt_boxes[j_gt, 1])))
+            bg = _bucket_index(rg, dist_bins)
+            dist_cnt[bg]["fn"] += 1
+
+            vg = 0.0
+            if gt_boxes.shape[1] >= 9:
+                vg = float(np.hypot(float(gt_boxes[j_gt, 7]), float(gt_boxes[j_gt, 8])))
+            sg = _bucket_index(vg, speed_bins)
+            speed_cnt[sg]["fn"] += 1
+
+    per_class: Dict[str, Dict[str, float]] = {}
+    for c in sorted(cls_cnt.keys()):
+        cc = cls_cnt[c]
+        per_class[str(int(c))] = _safe_metric_dict(cc["tp"], cc["fp"], cc["fn"])
+
+    by_distance: Dict[str, Dict[str, float]] = {}
+    for i, cc in enumerate(dist_cnt):
+        by_distance[_bucket_name(i, dist_bins)] = _safe_metric_dict(cc["tp"], cc["fp"], cc["fn"])
+
+    by_speed: Dict[str, Dict[str, float]] = {}
+    for i, cc in enumerate(speed_cnt):
+        by_speed[_bucket_name(i, speed_bins)] = _safe_metric_dict(cc["tp"], cc["fp"], cc["fn"])
+
+    return {
+        "overall": {
+            "P": float(m.P),
+            "R": float(m.R),
+            "F1": float(m.F1),
+            "tp": int(m.tp),
+            "fp": int(m.fp),
+            "fn": int(m.fn),
+            "num_frames": int(m.num_frames),
+            "num_det": int(m.num_det),
+            "num_gt": int(m.num_gt),
+            "attr_acc": float(m.attr_acc),
+            "attr_macro_f1": float(m.attr_macro_f1),
+            "attr_num_tp_with_attr": int(m.attr_num_tp_with_attr),
+        },
+        "per_class": per_class,
+        "by_distance": by_distance,
+        "by_speed": by_speed,
+        "distance_bins": [float(x) for x in dist_bins],
+        "speed_bins": [float(x) for x in speed_bins],
+    }

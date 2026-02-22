@@ -14,6 +14,7 @@ Checkpoint model_type:
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 import math
 import os
@@ -139,11 +140,23 @@ def _build_pair_graph(
     X_raw_f: np.ndarray,
     idx: Dict[str, int],
     pair_radius: float,
+    pair_max_neighbors: int,
     close_min: float = 0.10,
 ) -> Tuple[np.ndarray, np.ndarray]:
     n = int(X_raw_f.shape[0])
     if n <= 1:
         return np.zeros((0, 9), dtype=np.float32), np.zeros((0, 2), dtype=np.int64)
+
+    r = float(max(pair_radius, 1e-6))
+    cell = r
+    buckets: Dict[Tuple[int, int, int], List[int]] = {}
+    for i in range(n):
+        li = int(X_raw_f[i, idx["label"]])
+        x, y = float(X_raw_f[i, idx["x"]]), float(X_raw_f[i, idx["y"]])
+        ix = int(np.floor(x / cell))
+        iy = int(np.floor(y / cell))
+        buckets.setdefault((li, ix, iy), []).append(int(i))
+
     feats: List[np.ndarray] = []
     pairs: List[Tuple[int, int]] = []
     for i in range(n):
@@ -155,13 +168,28 @@ def _build_pair_graph(
         wi = 1.0 if float(X_raw_f[i, idx["is_warp"]]) > 0.5 else 0.0
         sc1 = float(X_raw_f[i, idx["score"]])
         sp1 = float(X_raw_f[i, idx["speed"]])
-        for j in range(i + 1, n):
-            lj = int(X_raw_f[j, idx["label"]])
-            if li != lj:
-                continue
-            x2, y2 = float(X_raw_f[j, idx["x"]]), float(X_raw_f[j, idx["y"]])
-            d = float(np.hypot(x1 - x2, y1 - y2))
-            close = float(np.exp(-d / max(pair_radius, 1e-6)))
+
+        ix = int(np.floor(x1 / cell))
+        iy = int(np.floor(y1 / cell))
+        neigh: List[Tuple[float, int]] = []
+        for dx_cell in (-1, 0, 1):
+            for dy_cell in (-1, 0, 1):
+                for j in buckets.get((li, ix + dx_cell, iy + dy_cell), []):
+                    if int(j) <= i:
+                        continue
+                    x2, y2 = float(X_raw_f[j, idx["x"]]), float(X_raw_f[j, idx["y"]])
+                    d = float(np.hypot(x1 - x2, y1 - y2))
+                    if d <= r:
+                        neigh.append((d, int(j)))
+
+        if len(neigh) == 0:
+            continue
+        neigh.sort(key=lambda x: x[0])
+        if pair_max_neighbors > 0:
+            neigh = neigh[: int(pair_max_neighbors)]
+
+        for d, j in neigh:
+            close = float(np.exp(-d / r))
             if close < close_min:
                 continue
             dx2 = abs(float(X_raw_f[j, idx["dx"]]))
@@ -169,6 +197,7 @@ def _build_pair_graph(
             dt2 = int(round(float(X_raw_f[j, idx["from_dt"]])))
             wj = 1.0 if float(X_raw_f[j, idx["is_warp"]]) > 0.5 else 0.0
             sc2 = float(X_raw_f[j, idx["score"]])
+            x2, y2 = float(X_raw_f[j, idx["x"]]), float(X_raw_f[j, idx["y"]])
             sp2 = float(X_raw_f[j, idx["speed"]])
             ov = _pair_overlap_min(x1, y1, dx1, dy1, x2, y2, dx2, dy2)
             feat = np.asarray(
@@ -260,7 +289,22 @@ def _build_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     p.add_argument("--struct_frames_per_step", type=int, default=int(cfg.get("struct_frames_per_step", 4)))
     p.add_argument("--struct_max_cands_per_frame", type=int, default=int(cfg.get("struct_max_cands_per_frame", 64)))
     p.add_argument("--pair_radius", type=float, default=float(cfg.get("pair_radius", 2.5)))
+    p.add_argument("--pair_max_neighbors", type=int, default=int(cfg.get("pair_max_neighbors", 12)))
+    p.add_argument("--pair_cache_max_frames", type=int, default=int(cfg.get("pair_cache_max_frames", 512)))
     p.add_argument("--pair_energy_scale", type=float, default=float(cfg.get("pair_energy_scale", 1.0)))
+    p.add_argument("--raw_pos_score_thr", type=float, default=float(cfg.get("raw_pos_score_thr", 0.30)))
+    p.add_argument("--neg_warp_gain_thr", type=float, default=float(cfg.get("neg_warp_gain_thr", 0.0)))
+    p.add_argument("--neg_dup_thr", type=float, default=float(cfg.get("neg_dup_thr", 0.55)))
+    p.add_argument("--neg_score_thr", type=float, default=float(cfg.get("neg_score_thr", 0.35)))
+    p.add_argument("--neg_reg_weight", type=float, default=float(cfg.get("neg_reg_weight", 0.30)))
+    p.add_argument("--pair_sup_weight", type=float, default=float(cfg.get("pair_sup_weight", 0.20)))
+    p.add_argument("--pair_conflict_overlap_thr", type=float, default=float(cfg.get("pair_conflict_overlap_thr", 0.55)))
+    p.add_argument("--pair_conflict_close_thr", type=float, default=float(cfg.get("pair_conflict_close_thr", 0.60)))
+    p.add_argument("--pair_conflict_dup_thr", type=float, default=float(cfg.get("pair_conflict_dup_thr", 0.55)))
+    p.add_argument("--pair_conflict_weight", type=float, default=float(cfg.get("pair_conflict_weight", 2.0)))
+    p.add_argument("--target_recall", type=float, default=cfg.get("target_recall"))
+    p.add_argument("--target_select_metric", type=str, default=str(cfg.get("target_select_metric", "precision")),
+                   choices=["precision", "f1"])
     return p
 
 
@@ -285,6 +329,11 @@ def main() -> None:
     data = np.load(in_npz, allow_pickle=True)
     X_raw = np.asarray(data["X"], dtype=np.float32)
     y = np.asarray(data["y_keep"], dtype=np.float32).reshape(-1)
+    cand_is_gt_best = np.asarray(data["cand_is_gt_best"], dtype=np.float32).reshape(-1) if "cand_is_gt_best" in data.files else np.zeros_like(y)
+    cand_cover_gain_greedy = np.asarray(data["cand_cover_gain_greedy"], dtype=np.float32).reshape(-1) if "cand_cover_gain_greedy" in data.files else (
+        np.asarray(data["cand_cover_gain"], dtype=np.float32).reshape(-1) if "cand_cover_gain" in data.files else np.zeros_like(y)
+    )
+    cand_dup_risk = np.asarray(data["cand_dup_risk"], dtype=np.float32).reshape(-1) if "cand_dup_risk" in data.files else np.zeros_like(y)
     scene_idx = np.asarray(data["scene_idx"], dtype=np.int64).reshape(-1)
     frame_idx = np.asarray(data["frame_idx"], dtype=np.int64).reshape(-1)
     feat_names = [str(x) for x in data["feature_names"].tolist()]
@@ -345,6 +394,9 @@ def main() -> None:
 
     X_t = torch.from_numpy(X).to(device=device, dtype=torch.float32)
     y_t = torch.from_numpy(y).to(device=device, dtype=torch.float32)
+    y_best_t = torch.from_numpy(cand_is_gt_best).to(device=device, dtype=torch.float32)
+    gain_t = torch.from_numpy(cand_cover_gain_greedy).to(device=device, dtype=torch.float32)
+    dup_t = torch.from_numpy(cand_dup_risk).to(device=device, dtype=torch.float32)
 
     print("[4/6] Training...")
     bs = int(max(1024, args.batch_size))
@@ -354,17 +406,32 @@ def main() -> None:
     struct_frames_per_step = int(max(0, args.struct_frames_per_step))
     struct_max_cands = int(max(4, args.struct_max_cands_per_frame))
     pair_radius = float(args.pair_radius)
+    pair_max_neighbors = int(max(1, args.pair_max_neighbors))
+    pair_cache_max_frames = int(max(0, args.pair_cache_max_frames))
     pair_scale = float(args.pair_energy_scale)
+    neg_reg_weight = float(args.neg_reg_weight)
+    pair_sup_weight = float(args.pair_sup_weight)
+    pair_conflict_overlap_thr = float(args.pair_conflict_overlap_thr)
+    pair_conflict_close_thr = float(args.pair_conflict_close_thr)
+    pair_conflict_dup_thr = float(args.pair_conflict_dup_thr)
+    pair_conflict_weight = float(max(0.0, args.pair_conflict_weight))
+    margin_t = torch.tensor(struct_margin, dtype=torch.float32, device=device)
 
     rng = np.random.default_rng(int(args.seed))
     tr_rows = tr_idx.copy()
     steps_per_epoch = int(math.ceil(max(1, tr_rows.size) / float(bs)))
+    pair_graph_cache: "OrderedDict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+    pair_cache_hit = 0
+    pair_cache_miss = 0
+    pair_cache_evict = 0
 
     for ep in range(1, epochs + 1):
         rng.shuffle(tr_rows)
         loss_sum = 0.0
         bce_sum = 0.0
         struct_sum = 0.0
+        neg_sum = 0.0
+        pair_sup_sum = 0.0
 
         for st in range(steps_per_epoch):
             s = st * bs
@@ -381,20 +448,56 @@ def main() -> None:
                 if not tr_frame_keys:
                     break
                 fk = tr_frame_keys[int(rng.integers(0, len(tr_frame_keys)))]
-                rows = tr_frame_map[fk]
-                if rows.size <= 1:
+                rows_all = tr_frame_map[fk]
+                if rows_all.size <= 1:
                     continue
-                if rows.size > struct_max_cands:
-                    rows = rng.choice(rows, size=struct_max_cands, replace=False)
+                use_full_frame = rows_all.size <= struct_max_cands
+                rows = rows_all
+                if not use_full_frame:
+                    rows = rng.choice(rows_all, size=struct_max_cands, replace=False)
                 rows = np.asarray(rows, dtype=np.int64)
 
                 xf = X_t[rows]
                 yf = y_t[rows]
+                y_best_f = y_best_t[rows]
+                gain_f = gain_t[rows]
+                dup_f = dup_t[rows]
                 logits_f = model.unary_logits(xf)
                 unary_e = -logits_f
 
                 X_raw_f = X_raw[rows]
-                pair_feat_np, pair_ij_np = _build_pair_graph(X_raw_f, name_to_idx, pair_radius=pair_radius, close_min=0.10)
+                is_raw_f = torch.from_numpy((X_raw_f[:, name_to_idx["is_raw"]] > 0.5).astype(np.float32)).to(device=device)
+                is_warp_f = torch.from_numpy((X_raw_f[:, name_to_idx["is_warp"]] > 0.5).astype(np.float32)).to(device=device)
+                score_f = torch.from_numpy(X_raw_f[:, name_to_idx["score"]].astype(np.float32)).to(device=device)
+
+                # Positive set aligned with target: GT-best + high-quality raw keep.
+                y_pos = torch.where(
+                    (y_best_f > 0.5) | ((yf > 0.5) & (is_raw_f > 0.5) & (score_f >= float(args.raw_pos_score_thr))),
+                    torch.ones_like(yf),
+                    torch.zeros_like(yf),
+                )
+                if float(torch.sum(y_pos).item()) <= 0.0:
+                    y_pos = torch.where(yf > 0.5, torch.ones_like(yf), torch.zeros_like(yf))
+
+                if use_full_frame and pair_cache_max_frames > 0 and fk in pair_graph_cache:
+                    pair_feat_np, pair_ij_np = pair_graph_cache[fk]
+                    pair_graph_cache.move_to_end(fk, last=True)
+                    pair_cache_hit += 1
+                else:
+                    pair_feat_np, pair_ij_np = _build_pair_graph(
+                        X_raw_f,
+                        name_to_idx,
+                        pair_radius=pair_radius,
+                        pair_max_neighbors=pair_max_neighbors,
+                        close_min=0.10,
+                    )
+                    if use_full_frame and pair_cache_max_frames > 0:
+                        pair_graph_cache[fk] = (pair_feat_np, pair_ij_np)
+                        pair_graph_cache.move_to_end(fk, last=True)
+                        while len(pair_graph_cache) > pair_cache_max_frames:
+                            pair_graph_cache.popitem(last=False)
+                            pair_cache_evict += 1
+                        pair_cache_miss += 1
                 if pair_feat_np.shape[0] > 0:
                     pf = torch.from_numpy(pair_feat_np).to(device=device, dtype=torch.float32)
                     p_logits = model.pair_logits(pf)
@@ -402,6 +505,7 @@ def main() -> None:
                     pair_e = pair_scale * (0.5 - p_prob)
                     pair_e_np = pair_e.detach().cpu().numpy()
                 else:
+                    p_logits = torch.zeros((0,), dtype=torch.float32, device=device)
                     pair_e = torch.zeros((0,), dtype=torch.float32, device=device)
                     pair_e_np = np.zeros((0,), dtype=np.float32)
 
@@ -412,16 +516,46 @@ def main() -> None:
                 )
                 y_neg = torch.from_numpy(y_neg_np).to(device=device, dtype=torch.float32)
 
-                e_pos = torch.sum(yf * unary_e)
+                e_pos = torch.sum(y_pos * unary_e)
                 e_neg = torch.sum(y_neg * unary_e)
                 if pair_e.shape[0] > 0:
                     ii = torch.from_numpy(pair_ij_np[:, 0]).to(device=device, dtype=torch.long)
                     jj = torch.from_numpy(pair_ij_np[:, 1]).to(device=device, dtype=torch.long)
-                    e_pos = e_pos + torch.sum(yf[ii] * yf[jj] * pair_e)
+                    e_pos = e_pos + torch.sum(y_pos[ii] * y_pos[jj] * pair_e)
                     e_neg = e_neg + torch.sum(y_neg[ii] * y_neg[jj] * pair_e)
 
-                frame_loss = F.relu(torch.tensor(struct_margin, dtype=torch.float32, device=device) + e_pos - e_neg)
+                    pair_support = (y_pos[ii] * y_pos[jj]).detach()
+                    overlap = pf[:, 2]
+                    close = pf[:, 1]
+                    dup_pair = torch.maximum(dup_f[ii], dup_f[jj])
+                    pair_conflict = (
+                        (overlap >= pair_conflict_overlap_thr)
+                        & (close >= pair_conflict_close_thr)
+                        & (dup_pair >= pair_conflict_dup_thr)
+                    ) & (pair_support < 0.5)
+                    pair_target = torch.where(pair_conflict, torch.zeros_like(pair_support), pair_support)
+                    pair_w = torch.ones_like(pair_target) + pair_conflict.float() * pair_conflict_weight
+                    pair_sup_loss = F.binary_cross_entropy_with_logits(p_logits, pair_target, weight=pair_w)
+                else:
+                    pair_sup_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+                hard_neg = (
+                    (yf <= 0.5)
+                    & (
+                        ((is_warp_f > 0.5) & (gain_f <= float(args.neg_warp_gain_thr)))
+                        | ((dup_f >= float(args.neg_dup_thr)) & (score_f >= float(args.neg_score_thr)))
+                    )
+                ).float()
+                neg_pen = torch.sum(hard_neg * torch.sigmoid(logits_f)) / torch.clamp(torch.sum(hard_neg), min=1.0)
+
+                frame_loss = (
+                    F.relu(margin_t + e_pos - e_neg)
+                    + neg_reg_weight * neg_pen
+                    + pair_sup_weight * pair_sup_loss
+                )
                 struct_losses.append(frame_loss)
+                neg_sum += float(neg_pen.item())
+                pair_sup_sum += float(pair_sup_loss.item())
 
             if struct_losses:
                 struct_loss = torch.stack(struct_losses).mean()
@@ -448,12 +582,14 @@ def main() -> None:
                 print(
                     f"  epoch={ep:03d} loss={loss_sum/max(1,steps_per_epoch):.6f} "
                     f"bce={bce_sum/max(1,steps_per_epoch):.6f} struct={struct_sum/max(1,steps_per_epoch):.6f} "
+                    f"neg={neg_sum/max(1,steps_per_epoch):.6f} pair_sup={pair_sup_sum/max(1,steps_per_epoch):.6f} "
                     f"train_f1@0.5={tr_m['F1']:.4f} val_f1@0.5={va_m['F1']:.4f} val_f2@0.5={va_m['F2']:.4f}"
                 )
             else:
                 print(
                     f"  epoch={ep:03d} loss={loss_sum/max(1,steps_per_epoch):.6f} "
                     f"bce={bce_sum/max(1,steps_per_epoch):.6f} struct={struct_sum/max(1,steps_per_epoch):.6f} "
+                    f"neg={neg_sum/max(1,steps_per_epoch):.6f} pair_sup={pair_sup_sum/max(1,steps_per_epoch):.6f} "
                     f"train_f1@0.5={tr_m['F1']:.4f}"
                 )
 
@@ -462,18 +598,30 @@ def main() -> None:
     if len(thr_grid) == 0:
         thr_grid = [0.5]
     metric_key = "F2" if str(args.threshold_metric).lower() == "f2" else "F1"
+    target_recall = float(args.target_recall) if (args.target_recall is not None) else None
+    target_select_metric = str(args.target_select_metric).lower()
+
+    def _pick_best(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
+        if len(metrics_list) == 0:
+            return _metrics_from_probs(y[tr_idx], torch.sigmoid(model.unary_logits(X_t[tr_idx])).detach().cpu().numpy(), thr=0.5)
+        if target_recall is None:
+            return max(metrics_list, key=lambda m: float(m.get(metric_key, 0.0)))
+        feas = [m for m in metrics_list if float(m.get("R", 0.0)) >= target_recall]
+        if len(feas) > 0:
+            if target_select_metric == "f1":
+                return max(feas, key=lambda m: (float(m.get("F1", 0.0)), float(m.get("P", 0.0)), float(m.get("R", 0.0))))
+            return max(feas, key=lambda m: (float(m.get("P", 0.0)), float(m.get("F1", 0.0)), float(m.get("R", 0.0))))
+        return max(metrics_list, key=lambda m: (float(m.get("R", 0.0)), float(m.get("P", 0.0)), float(m.get("F1", 0.0))))
+
     with torch.no_grad():
         if va_idx.size > 0:
             va_probs = torch.sigmoid(model.unary_logits(X_t[va_idx])).detach().cpu().numpy()
-            best = None
-            for t in thr_grid:
-                m = _metrics_from_probs(y[va_idx], va_probs, thr=float(t))
-                if best is None or float(m.get(metric_key, 0.0)) > float(best.get(metric_key, 0.0)):
-                    best = m
-            assert best is not None
+            all_ms = [_metrics_from_probs(y[va_idx], va_probs, thr=float(t)) for t in thr_grid]
+            best = _pick_best(all_ms)
         else:
             tr_probs = torch.sigmoid(model.unary_logits(X_t[tr_idx])).detach().cpu().numpy()
-            best = _metrics_from_probs(y[tr_idx], tr_probs, thr=0.5)
+            all_ms = [_metrics_from_probs(y[tr_idx], tr_probs, thr=float(t)) for t in thr_grid]
+            best = _pick_best(all_ms)
     best_thr = float(best["threshold"])
 
     print("[6/6] Saving checkpoint...")
@@ -523,11 +671,29 @@ def main() -> None:
             "struct_frames_per_step": int(struct_frames_per_step),
             "struct_max_cands_per_frame": int(struct_max_cands),
             "pair_radius": float(pair_radius),
+            "pair_max_neighbors": int(pair_max_neighbors),
             "pair_energy_scale": float(pair_scale),
+            "pair_cache_max_frames": int(pair_cache_max_frames),
+            "pair_conflict_overlap_thr": float(pair_conflict_overlap_thr),
+            "pair_conflict_close_thr": float(pair_conflict_close_thr),
+            "pair_conflict_dup_thr": float(pair_conflict_dup_thr),
+            "pair_conflict_weight": float(pair_conflict_weight),
+            "raw_pos_score_thr": float(args.raw_pos_score_thr),
+            "neg_warp_gain_thr": float(args.neg_warp_gain_thr),
+            "neg_dup_thr": float(args.neg_dup_thr),
+            "neg_score_thr": float(args.neg_score_thr),
+            "neg_reg_weight": float(args.neg_reg_weight),
+            "pair_sup_weight": float(args.pair_sup_weight),
+            "target_recall": target_recall,
+            "target_select_metric": target_select_metric,
             "split_by": str(args.split_by),
             "val_ratio": float(args.val_ratio),
             "seed": int(args.seed),
             "device": str(device),
+            "pair_cache_size": int(len(pair_graph_cache)),
+            "pair_cache_hit": int(pair_cache_hit),
+            "pair_cache_miss": int(pair_cache_miss),
+            "pair_cache_evict": int(pair_cache_evict),
         },
     }
     with open(out_ckpt, "w", encoding="utf-8") as f:
@@ -559,4 +725,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -42,7 +42,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -68,6 +68,74 @@ def _log(msg: str, pipeline_log_path: Optional[str] = None) -> None:
     print(msg)
     if pipeline_log_path:
         _append_text(pipeline_log_path, msg + "\n")
+
+
+def _load_cfg_file(path: str) -> Dict[str, Any]:
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    if ext in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+        except Exception as e:
+            raise RuntimeError("YAML config requires pyyaml to sync threshold.") from e
+        obj = yaml.safe_load(txt)
+    else:
+        obj = json.loads(txt)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Config root must be dict, got: {type(obj)}")
+    return obj
+
+
+def _dump_cfg_file(path: str, cfg: Dict[str, Any]) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "w", encoding="utf-8") as f:
+        if ext in (".yaml", ".yml"):
+            try:
+                import yaml  # type: ignore
+            except Exception as e:
+                raise RuntimeError("YAML config requires pyyaml to sync threshold.") from e
+            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+        else:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+
+def _read_best_threshold(summary_path: str) -> Optional[float]:
+    if not os.path.isfile(summary_path):
+        return None
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        thr = obj.get("best_threshold", None)
+        if thr is None:
+            return None
+        return float(thr)
+    except Exception:
+        return None
+
+
+def _sync_best_threshold_to_infer_config(
+    src_cfg_path: str,
+    dst_cfg_path: str,
+    best_thr: float,
+) -> str:
+    cfg = _load_cfg_file(src_cfg_path)
+    thr = float(best_thr)
+    cfg["ebm_auto_threshold_from_ckpt"] = True
+    cfg["ebm_ckpt_threshold_field"] = "best_threshold"
+    cfg["keep_thr"] = thr
+    cfg["seed_keep_thr"] = thr
+    fill_old = cfg.get("fill_keep_thr", thr)
+    try:
+        fill_val = float(fill_old)
+    except Exception:
+        fill_val = thr
+    cfg["fill_keep_thr"] = min(fill_val, thr)
+    cfg["ebm_stage_a_keep_thr"] = thr
+    _ensure_dir(os.path.dirname(dst_cfg_path))
+    _dump_cfg_file(dst_cfg_path, cfg)
+    return dst_cfg_path
 
 
 def _run_and_tee(
@@ -139,6 +207,11 @@ def main() -> None:
                     help="Eval config path (required when --eval_after_train).")
     ap.add_argument("--eval_limit_scenes", type=int, default=None,
                     help="Optional limit_scenes override for infer/eval stages.")
+    ap.add_argument(
+        "--skip_save_out_json",
+        action="store_true",
+        help="When eval_after_train is enabled, delete large post-train out_refined.json after eval.",
+    )
     ap.add_argument("--auto_tune_infer", action="store_true",
                     help="Auto-tune infer params after training and before post-train infer/eval.")
     ap.add_argument("--tune_target_recall", type=float, default=0.76,
@@ -286,6 +359,9 @@ def main() -> None:
     eval_rc: Optional[int] = None
     tune_rc: Optional[int] = None
     infer_cfg_for_eval = args.infer_config
+    infer_cfg_synced: Optional[str] = None
+    best_thr_synced: Optional[float] = None
+    out_refined_removed = False
 
     if args.eval_after_train and args.auto_tune_infer and build_rc == 0 and train_rc == 0:
         tune_cmd: List[str] = [
@@ -327,6 +403,24 @@ def main() -> None:
             infer_cfg_for_eval = tuned_infer_cfg
 
     if args.eval_after_train and build_rc == 0 and train_rc == 0 and (tune_rc in (None, 0)):
+        best_thr = _read_best_threshold(train_summary)
+        if best_thr is not None and infer_cfg_for_eval is not None:
+            infer_ext = os.path.splitext(infer_cfg_for_eval)[1] or ".yaml"
+            infer_cfg_synced = os.path.join(cfg_dir, f"infer.synced_thr{infer_ext}")
+            try:
+                infer_cfg_for_eval = _sync_best_threshold_to_infer_config(
+                    src_cfg_path=infer_cfg_for_eval,
+                    dst_cfg_path=infer_cfg_synced,
+                    best_thr=float(best_thr),
+                )
+                best_thr_synced = float(best_thr)
+                _log(
+                    f"[train_pipeline] synced best_threshold={best_thr_synced:.4f} -> {infer_cfg_for_eval}",
+                    pipeline_log,
+                )
+            except Exception as e:
+                _log(f"[train_pipeline] warning: failed to sync best threshold into infer config: {repr(e)}", pipeline_log)
+
         infer_cmd: List[str] = [
             py,
             os.path.join(SCRIPTS_DIR, "run_infer.py"),
@@ -375,6 +469,13 @@ def main() -> None:
                 pipeline_log_path=pipeline_log,
                 stage_name="eval",
             )
+            if bool(args.skip_save_out_json) and os.path.exists(out_refined_json):
+                try:
+                    os.remove(out_refined_json)
+                    out_refined_removed = True
+                    _log(f"[train_pipeline] removed out_refined_json -> {out_refined_json}", pipeline_log)
+                except Exception as e:
+                    _log(f"[train_pipeline] warning: failed to remove out_refined_json: {repr(e)}", pipeline_log)
 
     manifest = {
         "run_id": run_id,
@@ -425,8 +526,11 @@ def main() -> None:
             "energy_summary": energy_summary,
             "tune_summary": tune_summary,
             "tuned_infer_config": tuned_infer_cfg if args.auto_tune_infer else None,
+            "synced_infer_config": infer_cfg_synced,
+            "synced_best_threshold": best_thr_synced,
             "infer_config_used_for_eval": os.path.abspath(infer_cfg_for_eval) if args.eval_after_train else None,
-            "out_refined_json": out_refined_json,
+            "out_refined_json": (None if out_refined_removed else out_refined_json),
+            "out_refined_json_removed": bool(out_refined_removed),
             "infer_summary": infer_summary,
             "eval_summary": eval_summary,
         },

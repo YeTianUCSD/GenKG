@@ -1,5 +1,6 @@
+# Fixed baseline for framework iteration (no hyperparameter search).
 # run with:
-# python scripts/train_energy.py --config configs/train_energy.yaml
+# python scripts/train_energy.py --config configs/train_energy_fixed.yaml
 
 in_npz: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset.npz
 out_ckpt: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/energy_logreg.json
@@ -21,39 +22,27 @@ l2: 1.0e-6
 # class imbalance
 pos_weight_mode: auto
 pos_weight: 1.0
-weight_label_source: train
-aux_mask_source: train
-aux_mask_thr: 0.5
-eval_label_source: hard
-eval_label_thr: 0.5
-keep_target_type: soft
-soft_target_mix: 1.0
-unique_target_field: y_unique
-lambda_unique: 0.05
-unique_pos_only: true
-unique_neg_weight: 0.05
 
-# threshold selection on val (f2 favors recall)
+# threshold selection on val
 threshold_metric: f2
 threshold_grid: "0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60"
 relation_feature_names: "temporal_stability,local_density,support_count,support_unique_dt,support_score_mean,support_abs_dt_mean,support_raw_ratio,support_warp_ratio,temporal_local_interaction,support_density_interaction"
 
-# stage-2 multitask (new)
+# multitask losses
 enable_multitask: true
 gain_target_field: cand_cover_gain_greedy
 gain_target_clip: 1.0
 gain_pos_only: true
-dup_neg_only: false
+dup_neg_only: true
 lambda_gain: 0.25
-lambda_dup: 0.08
+lambda_dup: 0.15
 dup_weight_power: 1.0
 enable_pairwise_dup: true
-lambda_pair_dup: 0.10
+lambda_pair_dup: 0.20
 pair_rank_margin_eps: 0.05
-pair_conflict_dup_min: 0.35
+pair_conflict_dup_min: 0.20
 pair_max_samples_per_epoch: 200000
 pair_batch_size: 4096
-pair_warp_relax: 0.5
 target_recall: 0.82
 target_select_metric: f1
 
@@ -65,5 +54,4 @@ enable_attr_head: true
 lambda_attr: 0.10
 attr_pos_only: true
 
-# optional cap for quick debug
 max_train_rows: null

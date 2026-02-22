@@ -97,6 +97,15 @@ class InferConfig:
     min_dist_to_seed: float = 0.8
     max_fill: int = 300
 
+    # ===== EBM dual-head staged solve knobs (used by model.ebm when backend="ebm") =====
+    dual_head_solver: bool = True
+    stage_a_keep_thr: float = 0.50
+    stage_b_add_thr: float = 0.35
+    stage_b_min_potential_dist: float = 1.2
+    stage_b_min_potential: float = 0.25
+    stage_c_attr_scale: float = 0.20
+    stage_c_rel_scale: float = 0.20
+
 
 # -----------------------------
 # Utilities

@@ -1,10 +1,10 @@
+# Fixed baseline for framework iteration (no auto tuning).
 # run with:
-# python scripts/run_infer.py --config configs/infer_ebm.yaml
+# python scripts/run_infer.py --config configs/infer_ebm_fixed.yaml --ckpt_path <train_ckpt>
 
 in_json: /home/code/3Ddetection/IS-Fusion/GenKG/code/model/dataset/sorted_by_scene_ISFUSIONandGTattr_val.json
 out_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/out_refined.json
 
-# null = full dataset; set integer (e.g., 10) for quick debug
 limit_scenes: null
 log_every_scenes: 10
 require_gt: false
@@ -21,15 +21,15 @@ ignore_classes: "-1"
 # inference backend
 backend: ebm
 use_sources: all
-keep_thr: 0.50
+keep_thr: 0.40
 nms_thr: 1.5
 topk: 200
-include_sources: true
+include_sources: false
 
-# ebm runtime kwargs (active in four_term mode)
+# ebm runtime kwargs
 ebm_energy_mode: four_term
 ebm_energy_select_margin: 0.0
-ebm_energy_prob_gate: 0.0
+ebm_energy_prob_gate: 0.40
 ebm_energy_local_refine: true
 ebm_energy_local_refine_rounds: 2
 ebm_w_keep: 1.0
@@ -54,10 +54,10 @@ ebm_context_cell_xy: 1.0
 ebm_context_min_density: 2
 ebm_context_shortfall_penalty: 0.08
 ebm_context_warp_only: true
+
+# learned heads
 ebm_unary_use_learned: true
-# Do not hardcode old experiment ckpt here.
-# Use run_train.py (it injects current train ckpt), or pass --ebm_unary_ckpt_path explicitly.
-ebm_unary_ckpt_path: null
+ebm_unary_ckpt_path: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/energy_logreg.json
 ebm_use_learned_class: true
 ebm_learned_class_min_prob: 0.55
 ebm_use_learned_attr: true
@@ -80,6 +80,10 @@ ebm_stage_b_enforce_class_conf: false
 ebm_stage_c_attr_scale: 0.20
 ebm_stage_c_rel_scale: 0.20
 
+# Important: disable auto-threshold backfill from ckpt to keep this config fixed.
+ebm_auto_threshold_from_ckpt: false
+ebm_ckpt_threshold_field: best_threshold
+
 # two-stage fill (legacy path; currently disabled)
 two_stage: false
 seed_keep_thr: 0.50
@@ -94,7 +98,7 @@ max_fill: 320
 write_mode: add
 det_key: det
 refined_key: det_refined
-write_fields: boxes_3d,labels_3d,scores_3d,attrs,sources
+write_fields: boxes_3d,labels_3d,scores_3d,attrs
 indent: 2
 
 dump_repl_map: null

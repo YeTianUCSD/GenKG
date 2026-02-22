@@ -8,10 +8,13 @@ out_meta: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/train
 # null = full dataset; set integer for quick iteration
 limit_scenes: null
 require_gt: true
+max_rows: null
+max_pair_edges: null
+log_every_frames: 200
 
 # training targets built from: all candidates (raw + warp) or raw-only
 target_candidates: all
-match_thr: 2.0
+match_thr: 2.5
 ignore_classes: "-1"
 
 # candidate generation
@@ -24,3 +27,4 @@ max_per_frame: 180
 
 # feature engineering
 support_cell: 1.0
+keep_soft_tau: 1.0

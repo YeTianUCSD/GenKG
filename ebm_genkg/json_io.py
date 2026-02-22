@@ -137,19 +137,21 @@ def iter_samples(
 
 @dataclass
 class LoadResult:
-    root: Any
+    root: Optional[Any]
     samples: List[Dict[str, Any]]
 
 
 def load_root_and_samples(
     json_path: str,
     require_gt: bool = True,
+    keep_root: bool = True,
 ) -> LoadResult:
     """
     Load JSON and collect sample nodes.
 
     - Adds a normalized integer timestamp field `_ts` into each sample dict.
     - Filters out nodes missing `scene_token` or timestamp.
+    - keep_root=False reduces peak memory for read-only pipelines.
     """
     with open(json_path, "r") as f:
         root = json.load(f)
@@ -167,7 +169,9 @@ def load_root_and_samples(
         s["_ts"] = int(ts)
         out.append(s)
 
-    return LoadResult(root=root, samples=out)
+    if keep_root:
+        return LoadResult(root=root, samples=out)
+    return LoadResult(root=None, samples=out)
 
 
 def group_by_scene(samples: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:

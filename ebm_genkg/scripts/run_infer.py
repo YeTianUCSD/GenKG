@@ -33,8 +33,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from json_io import load_root_and_samples, group_by_scene, write_refined_json, dump_json
-from data import CandidateConfig, build_frames_by_scene
+from json_io import load_root_and_samples, group_by_scene, sample_key_candidates, dump_json
+from data import CandidateConfig, build_candidates_for_scene
 from infer import InferConfig, infer_scene
 
 
@@ -70,13 +70,21 @@ def _load_cfg(path: Optional[str]) -> Dict[str, Any]:
 
 def _add_bool_arg(parser: argparse.ArgumentParser, name: str, default: bool, help_text: str) -> None:
     flag = "--" + name.replace("_", "-")
+    alt_flag = "--" + name
+    flags = [flag] if flag == alt_flag else [flag, alt_flag]
     if hasattr(argparse, "BooleanOptionalAction"):
-        parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=default, help=help_text)
+        parser.add_argument(*flags, action=argparse.BooleanOptionalAction, default=default, help=help_text)
         return
 
     group = parser.add_mutually_exclusive_group()
-    group.add_argument(flag, dest=name, action="store_true", help=help_text)
-    group.add_argument("--no-" + name.replace("_", "-"), dest=name, action="store_false", help=f"Disable {help_text}")
+    group.add_argument(*flags, dest=name, action="store_true", help=help_text)
+    group.add_argument(
+        "--no-" + name.replace("_", "-"),
+        "--no-" + name,
+        dest=name,
+        action="store_false",
+        help=f"Disable {help_text}",
+    )
     parser.set_defaults(**{name: default})
 
 
@@ -95,6 +103,36 @@ def _load_ckpt_threshold(ckpt_path: str, field_name: str = "best_threshold") -> 
         return None
 
 
+def _apply_payload_to_sample(
+    sample: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    mode: str,
+    det_key: str,
+    refined_key: str,
+    fields: Optional[list[str]],
+) -> None:
+    if mode == "replace":
+        target = sample.get(det_key, {}) or {}
+    else:
+        target = sample.get(refined_key, {}) or {}
+    if not isinstance(target, dict):
+        target = {}
+
+    if fields is None:
+        for kk, vv in payload.items():
+            target[kk] = vv
+    else:
+        for kk in fields:
+            if kk in payload:
+                target[kk] = payload[kk]
+
+    if mode == "replace":
+        sample[det_key] = target
+    else:
+        sample[refined_key] = target
+
+
 def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run ebm_genkg inference and write det_refined.")
 
@@ -103,8 +141,7 @@ def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     # IO
     p.add_argument("--in_json", type=str, default=cfg.get("in_json"), required=("in_json" not in cfg))
     p.add_argument("--out_json", type=str, default=cfg.get("out_json"), required=("out_json" not in cfg))
-    p.add_argument("--require_gt", action="store_true", default=bool(cfg.get("require_gt", False)),
-                   help="Require GT while loading samples.")
+    _add_bool_arg(p, "require_gt", bool(cfg.get("require_gt", False)), "Require GT while loading samples.")
     p.add_argument("--limit_scenes", type=int, default=cfg.get("limit_scenes"),
                    help="Only run first K scenes for quick iteration.")
     p.add_argument("--log_every_scenes", type=int, default=int(cfg.get("log_every_scenes", 10)))
@@ -138,6 +175,20 @@ def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     # EBM kwargs (packed into InferConfig.ebm_kwargs)
     p.add_argument("--ebm_prefilter_topm_seed", type=int, default=int(cfg.get("ebm_prefilter_topm_seed", 800)))
     p.add_argument("--ebm_prefilter_topm_fill", type=int, default=int(cfg.get("ebm_prefilter_topm_fill", 1200)))
+    _add_bool_arg(
+        p,
+        "ebm_adaptive_prefilter",
+        bool(cfg.get("ebm_adaptive_prefilter", True)),
+        "Use adaptive prefilter budget based on per-frame candidate count",
+    )
+    p.add_argument("--ebm_adaptive_prefilter_base", type=int, default=int(cfg.get("ebm_adaptive_prefilter_base", 128)))
+    p.add_argument(
+        "--ebm_adaptive_prefilter_sqrt_scale",
+        type=float,
+        default=float(cfg.get("ebm_adaptive_prefilter_sqrt_scale", 48.0)),
+    )
+    p.add_argument("--ebm_adaptive_prefilter_min", type=int, default=int(cfg.get("ebm_adaptive_prefilter_min", 256)))
+    p.add_argument("--ebm_adaptive_prefilter_max", type=int, default=int(cfg.get("ebm_adaptive_prefilter_max", 4096)))
     p.add_argument(
         "--ebm_energy_mode",
         type=str,
@@ -225,6 +276,66 @@ def _make_parser(cfg: Dict[str, Any]) -> argparse.ArgumentParser:
     p.add_argument("--ebm_unary_ckpt_path", type=str, default=cfg.get("ebm_unary_ckpt_path"))
     _add_bool_arg(p, "ebm_unary_use_learned", bool(cfg.get("ebm_unary_use_learned", True)),
                   "Use learned unary ckpt in EBM when provided")
+    _add_bool_arg(
+        p,
+        "ebm_use_learned_class",
+        bool(cfg.get("ebm_use_learned_class", True)),
+        "Use learned class head from unary ckpt to relabel detections",
+    )
+    p.add_argument(
+        "--ebm_learned_class_min_prob",
+        type=float,
+        default=float(cfg.get("ebm_learned_class_min_prob", 0.55)),
+        help="Minimum class posterior to accept learned class relabel.",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_use_learned_attr",
+        bool(cfg.get("ebm_use_learned_attr", True)),
+        "Use learned attr head from unary ckpt to predict attrs",
+    )
+    p.add_argument(
+        "--ebm_learned_attr_min_prob",
+        type=float,
+        default=float(cfg.get("ebm_learned_attr_min_prob", 0.50)),
+        help="Minimum attr posterior to accept learned attr prediction.",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_dual_head_solver",
+        bool(cfg.get("ebm_dual_head_solver", True)),
+        "Enable staged keep/add dual-head solve in four_term mode",
+    )
+    _add_bool_arg(
+        p,
+        "ebm_dual_head_unified_context",
+        bool(cfg.get("ebm_dual_head_unified_context", True)),
+        "Use unified candidate pool for dual-head solve (avoid raw-only hard cutoff).",
+    )
+    p.add_argument("--ebm_keep_head_raw_bias", type=float, default=float(cfg.get("ebm_keep_head_raw_bias", 0.20)))
+    p.add_argument("--ebm_keep_head_nonraw_bias", type=float, default=float(cfg.get("ebm_keep_head_nonraw_bias", -0.80)))
+    p.add_argument("--ebm_add_head_warp_bias", type=float, default=float(cfg.get("ebm_add_head_warp_bias", 0.25)))
+    p.add_argument("--ebm_add_head_nonwarp_bias", type=float, default=float(cfg.get("ebm_add_head_nonwarp_bias", -6.0)))
+    p.add_argument("--ebm_add_head_support_gain", type=float, default=float(cfg.get("ebm_add_head_support_gain", 0.20)))
+    p.add_argument("--ebm_add_head_potential_gain", type=float, default=float(cfg.get("ebm_add_head_potential_gain", 0.35)))
+    p.add_argument("--ebm_add_head_class_gain", type=float, default=float(cfg.get("ebm_add_head_class_gain", 0.25)))
+    p.add_argument("--ebm_stage_a_keep_thr", type=float, default=float(cfg.get("ebm_stage_a_keep_thr", 0.50)))
+    p.add_argument("--ebm_stage_b_add_thr", type=float, default=float(cfg.get("ebm_stage_b_add_thr", 0.35)))
+    p.add_argument(
+        "--ebm_stage_b_min_potential_dist",
+        type=float,
+        default=float(cfg.get("ebm_stage_b_min_potential_dist", 1.2)),
+    )
+    p.add_argument("--ebm_stage_b_min_potential", type=float, default=float(cfg.get("ebm_stage_b_min_potential", 0.25)))
+    p.add_argument("--ebm_stage_b_min_class_conf", type=float, default=float(cfg.get("ebm_stage_b_min_class_conf", 0.0)))
+    _add_bool_arg(
+        p,
+        "ebm_stage_b_enforce_class_conf",
+        bool(cfg.get("ebm_stage_b_enforce_class_conf", False)),
+        "Require class confidence gate in Stage-B add pool",
+    )
+    p.add_argument("--ebm_stage_c_attr_scale", type=float, default=float(cfg.get("ebm_stage_c_attr_scale", 0.20)))
+    p.add_argument("--ebm_stage_c_rel_scale", type=float, default=float(cfg.get("ebm_stage_c_rel_scale", 0.20)))
     _add_bool_arg(
         p,
         "ebm_auto_threshold_from_ckpt",
@@ -320,6 +431,18 @@ def main() -> None:
                 f"'{args.ebm_ckpt_threshold_field}' from {args.ebm_unary_ckpt_path}"
             )
 
+    # Safety fallback: when using learned unary in EBM, allow --ckpt_path to act as unary ckpt.
+    # This avoids silently using a stale ckpt path from config in ad-hoc inference runs.
+    if (
+        str(args.backend) == "ebm"
+        and bool(args.ebm_unary_use_learned)
+        and (not args.ebm_unary_ckpt_path)
+        and bool(args.ckpt_path)
+    ):
+        args.ebm_unary_ckpt_path = str(args.ckpt_path)
+        auto_thr_info["ckpt_path"] = str(args.ebm_unary_ckpt_path)
+        print(f"[ckpt-fallback] use --ckpt_path as ebm_unary_ckpt_path: {args.ebm_unary_ckpt_path}")
+
     ignore = _parse_ignore(args.ignore_classes)
 
     out_dir = os.path.dirname(os.path.abspath(args.out_json))
@@ -328,7 +451,9 @@ def main() -> None:
 
     print("[1/4] Loading samples...")
     t0 = time.time()
-    res = load_root_and_samples(args.in_json, require_gt=bool(args.require_gt))
+    res = load_root_and_samples(args.in_json, require_gt=bool(args.require_gt), keep_root=True)
+    if res.root is None:
+        raise RuntimeError("load_root_and_samples returned empty root unexpectedly.")
     scenes = group_by_scene(res.samples)
     if args.limit_scenes is not None:
         keys = sorted(list(scenes.keys()))[: int(args.limit_scenes)]
@@ -336,7 +461,6 @@ def main() -> None:
         print(f"  limit_scenes={args.limit_scenes} -> using scenes={len(scenes)}")
     print(f"  samples={len(res.samples)} scenes={len(scenes)} load_time={time.time()-t0:.1f}s")
 
-    print("[2/4] Building candidates...")
     t1 = time.time()
     cand_cfg = CandidateConfig(
         use_warp=bool(args.use_warp),
@@ -347,18 +471,7 @@ def main() -> None:
         raw_score_min=float(args.raw_score_min),
         max_per_frame=args.max_per_frame,
     )
-    frames_by_scene = build_frames_by_scene(scenes, cand_cfg)
-    tot_all = sum(len(fr.candidates) for fs in frames_by_scene.values() for fr in fs)
-    tot_raw = sum(
-        1
-        for fs in frames_by_scene.values()
-        for fr in fs
-        for c in fr.candidates
-        if c.source == "raw" and c.from_dt == 0
-    )
-    print(f"  candidate_total={tot_all} raw={tot_raw} warp_or_other={tot_all - tot_raw} build_time={time.time()-t1:.1f}s")
-
-    print("[3/4] Running inference...")
+    print("[2/4] Building candidates + running inference (stream by scene)...")
     t2 = time.time()
     ebm_kwargs = dict(cfg.get("ebm_kwargs", {}) if isinstance(cfg.get("ebm_kwargs", {}), dict) else {})
     ebm_kwargs.update(
@@ -374,6 +487,11 @@ def main() -> None:
             "hard_nms": bool(args.ebm_hard_nms),
             "prefilter_topm_seed": int(args.ebm_prefilter_topm_seed),
             "prefilter_topm_fill": int(args.ebm_prefilter_topm_fill),
+            "adaptive_prefilter": bool(args.ebm_adaptive_prefilter),
+            "adaptive_prefilter_base": int(args.ebm_adaptive_prefilter_base),
+            "adaptive_prefilter_sqrt_scale": float(args.ebm_adaptive_prefilter_sqrt_scale),
+            "adaptive_prefilter_min": int(args.ebm_adaptive_prefilter_min),
+            "adaptive_prefilter_max": int(args.ebm_adaptive_prefilter_max),
             "enable_label_vote": bool(args.ebm_enable_label_vote),
             "w_attr": float(args.ebm_w_attr),
             "enable_overlap_soft": bool(args.ebm_enable_overlap_soft),
@@ -392,6 +510,27 @@ def main() -> None:
             "context_warp_only": bool(args.ebm_context_warp_only),
             "unary_use_learned": bool(args.ebm_unary_use_learned),
             "unary_ckpt_path": (str(args.ebm_unary_ckpt_path) if args.ebm_unary_ckpt_path else None),
+            "use_learned_class": bool(args.ebm_use_learned_class),
+            "learned_class_min_prob": float(args.ebm_learned_class_min_prob),
+            "use_learned_attr": bool(args.ebm_use_learned_attr),
+            "learned_attr_min_prob": float(args.ebm_learned_attr_min_prob),
+            "dual_head_solver": bool(args.ebm_dual_head_solver),
+            "dual_head_unified_context": bool(args.ebm_dual_head_unified_context),
+            "keep_head_raw_bias": float(args.ebm_keep_head_raw_bias),
+            "keep_head_nonraw_bias": float(args.ebm_keep_head_nonraw_bias),
+            "add_head_warp_bias": float(args.ebm_add_head_warp_bias),
+            "add_head_nonwarp_bias": float(args.ebm_add_head_nonwarp_bias),
+            "add_head_support_gain": float(args.ebm_add_head_support_gain),
+            "add_head_potential_gain": float(args.ebm_add_head_potential_gain),
+            "add_head_class_gain": float(args.ebm_add_head_class_gain),
+            "stage_a_keep_thr": float(args.ebm_stage_a_keep_thr),
+            "stage_b_add_thr": float(args.ebm_stage_b_add_thr),
+            "stage_b_min_potential_dist": float(args.ebm_stage_b_min_potential_dist),
+            "stage_b_min_potential": float(args.ebm_stage_b_min_potential),
+            "stage_b_min_class_conf": float(args.ebm_stage_b_min_class_conf),
+            "stage_b_enforce_class_conf": bool(args.ebm_stage_b_enforce_class_conf),
+            "stage_c_attr_scale": float(args.ebm_stage_c_attr_scale),
+            "stage_c_rel_scale": float(args.ebm_stage_c_rel_scale),
         }
     )
 
@@ -411,17 +550,69 @@ def main() -> None:
         dt_cell_size=float(args.dt_cell_size),
         min_dist_to_seed=float(args.min_dist_to_seed),
         max_fill=int(args.max_fill),
+        dual_head_solver=bool(args.ebm_dual_head_solver),
+        stage_a_keep_thr=float(args.ebm_stage_a_keep_thr),
+        stage_b_add_thr=float(args.ebm_stage_b_add_thr),
+        stage_b_min_potential_dist=float(args.ebm_stage_b_min_potential_dist),
+        stage_b_min_potential=float(args.ebm_stage_b_min_potential),
+        stage_c_attr_scale=float(args.ebm_stage_c_attr_scale),
+        stage_c_rel_scale=float(args.ebm_stage_c_rel_scale),
         ebm_kwargs=ebm_kwargs,
     )
 
-    repl_map: Dict[str, Dict[str, Any]] = {}
-    scene_items = list(frames_by_scene.items())
-    total_scenes = len(scene_items)
-    total_frames = sum(len(frames) for _, frames in scene_items)
+    repl_map: Optional[Dict[str, Dict[str, Any]]] = {} if args.dump_repl_map else None
+    scene_keys = sorted(list(scenes.keys()))
+    total_scenes = len(scene_keys)
+    total_frames = sum(len(scenes[k]) for k in scene_keys)
     done_frames = 0
+    tot_all = 0
+    tot_raw = 0
+    matched = 0
+    updated = 0
+    build_time_acc = 0.0
+    infer_time_acc = 0.0
+    fields = [x.strip() for x in str(args.write_fields).split(",") if x.strip()]
+    fields_use = fields if len(fields) > 0 else None
 
-    for i, (_, frames) in enumerate(scene_items, start=1):
-        repl_map.update(infer_scene(frames, infer_cfg))
+    for i, sc in enumerate(scene_keys, start=1):
+        tb = time.time()
+        frames = build_candidates_for_scene(scenes[sc], cand_cfg)
+        build_time_acc += time.time() - tb
+
+        for fr in frames:
+            n_c = len(fr.candidates)
+            tot_all += n_c
+            if n_c > 0:
+                tot_raw += sum(1 for c in fr.candidates if c.source == "raw" and c.from_dt == 0)
+
+        ti = time.time()
+        scene_payloads = infer_scene(frames, infer_cfg)
+        infer_time_acc += time.time() - ti
+        if repl_map is not None:
+            repl_map.update(scene_payloads)
+
+        for fr in frames:
+            keys = sample_key_candidates(fr.sample)
+            chosen = None
+            for k in keys:
+                if k and str(k) != "":
+                    chosen = str(k)
+                    break
+            if chosen is None:
+                chosen = f"{fr.scene_token}:{fr.timestamp}"
+            payload = scene_payloads.get(chosen, None)
+            if payload is None:
+                continue
+            matched += 1
+            _apply_payload_to_sample(
+                fr.sample,
+                payload,
+                mode=str(args.write_mode),
+                det_key=str(args.det_key),
+                refined_key=str(args.refined_key),
+                fields=fields_use,
+            )
+            updated += 1
         done_frames += len(frames)
 
         if args.log_every_scenes > 0 and (i % int(args.log_every_scenes) == 0 or i == total_scenes):
@@ -432,9 +623,14 @@ def main() -> None:
                 f"elapsed={elapsed:.1f}s, fps={fps:.2f}"
             )
 
-    print(f"  repl_map_size={len(repl_map)} infer_time={time.time()-t2:.1f}s")
+    if repl_map is not None:
+        print(f"  repl_map_size={len(repl_map)} infer_time={time.time()-t2:.1f}s")
+    else:
+        print(f"  infer_time={time.time()-t2:.1f}s")
+    print(f"  candidate_total={tot_all} raw={tot_raw} warp_or_other={tot_all - tot_raw}")
+    print(f"  build_time={build_time_acc:.1f}s infer_core_time={infer_time_acc:.1f}s")
 
-    if args.dump_repl_map:
+    if args.dump_repl_map and repl_map is not None:
         dump_dir = os.path.dirname(os.path.abspath(args.dump_repl_map))
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
@@ -443,19 +639,9 @@ def main() -> None:
 
     print("[4/4] Writing output JSON...")
     t3 = time.time()
-    fields = [x.strip() for x in str(args.write_fields).split(",") if x.strip()]
-    stats = write_refined_json(
-        in_json_path=args.in_json,
-        out_json_path=args.out_json,
-        repl_map=repl_map,
-        mode=str(args.write_mode),
-        det_key=str(args.det_key),
-        refined_key=str(args.refined_key),
-        fields=fields if len(fields) > 0 else None,
-        indent=int(args.indent),
-    )
+    dump_json(res.root, args.out_json, indent=int(args.indent))
     print(
-        f"[writeback] matched={stats.matched} updated={stats.updated} visited={stats.visited} "
+        f"[writeback] matched={matched} updated={updated} visited={len(res.samples)} "
         f"total_time={time.time()-t0:.1f}s"
     )
 
@@ -477,16 +663,16 @@ def main() -> None:
             "num_candidates_total": int(tot_all),
             "num_candidates_raw": int(tot_raw),
             "num_candidates_warp_or_other": int(tot_all - tot_raw),
-            "repl_map_size": int(len(repl_map)),
+            "repl_map_size": int(len(repl_map)) if repl_map is not None else None,
             "writeback": {
-                "matched": int(stats.matched),
-                "updated": int(stats.updated),
-                "visited": int(stats.visited),
+                "matched": int(matched),
+                "updated": int(updated),
+                "visited": int(len(res.samples)),
             },
             "timing_sec": {
                 "load": float(t1 - t0),
-                "build": float(t2 - t1),
-                "infer": float(t3 - t2),
+                "build": float(build_time_acc),
+                "infer": float(infer_time_acc),
                 "write": float(time.time() - t3),
                 "total": float(time.time() - t0),
             },

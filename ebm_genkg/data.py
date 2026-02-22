@@ -111,6 +111,24 @@ class MatchTargets:
     num_gt_valid: int       # GT count after ignore_classes filtering
 
 
+@dataclass
+class CandidateGtLinks:
+    """
+    Dense candidate/gt link structure for set-style supervision.
+
+    - cand_to_gt: one best gt index per candidate (-1 for no feasible gt).
+    - cand_to_gt_dist: distance of cand_to_gt in XY space (inf for unmatched).
+    - gt_best_cand: one best candidate index per gt (-1 for uncovered gt).
+    - cand_cover_counts: how many gt each candidate can cover within class+distance gate.
+    - gt_candidate_counts: how many candidates can cover each gt within class+distance gate.
+    """
+    cand_to_gt: np.ndarray
+    cand_to_gt_dist: np.ndarray
+    gt_best_cand: np.ndarray
+    cand_cover_counts: np.ndarray
+    gt_candidate_counts: np.ndarray
+
+
 # -----------------------------
 # Parsing helpers
 # -----------------------------
@@ -302,6 +320,104 @@ def class_aware_greedy_match_xy(
         cls_tgt=cls_tgt,
         attr_tgt=attr_tgt,
         num_gt_valid=int(gt_xyz.shape[0]),
+    )
+
+
+def build_candidate_gt_links_xy(
+    det_xyz: np.ndarray,
+    det_labels: np.ndarray,
+    gt_xyz: np.ndarray,
+    gt_labels: np.ndarray,
+    thr_xy: float,
+    det_scores: Optional[np.ndarray] = None,
+) -> CandidateGtLinks:
+    """
+    Build candidate<->gt links under class-aware XY threshold.
+
+    Unlike class_aware_greedy_match_xy, this keeps dense feasibility information
+    and independent best links from both directions:
+      - candidate -> nearest feasible gt
+      - gt -> best candidate (nearest, tie-break by higher score)
+    """
+    det_xyz = np.asarray(det_xyz, dtype=np.float32).reshape(-1, 3)
+    gt_xyz = np.asarray(gt_xyz, dtype=np.float32).reshape(-1, 3)
+    det_labels = np.asarray(det_labels, dtype=np.int64).reshape(-1)
+    gt_labels = np.asarray(gt_labels, dtype=np.int64).reshape(-1)
+
+    n_det = int(det_xyz.shape[0])
+    n_gt = int(gt_xyz.shape[0])
+
+    cand_to_gt = np.full((n_det,), -1, dtype=np.int64)
+    cand_to_gt_dist = np.full((n_det,), np.inf, dtype=np.float32)
+    gt_best_cand = np.full((n_gt,), -1, dtype=np.int64)
+    cand_cover_counts = np.zeros((n_det,), dtype=np.int64)
+    gt_candidate_counts = np.zeros((n_gt,), dtype=np.int64)
+
+    if n_det == 0 or n_gt == 0:
+        return CandidateGtLinks(
+            cand_to_gt=cand_to_gt,
+            cand_to_gt_dist=cand_to_gt_dist,
+            gt_best_cand=gt_best_cand,
+            cand_cover_counts=cand_cover_counts,
+            gt_candidate_counts=gt_candidate_counts,
+        )
+
+    if det_scores is None:
+        det_scores_f = np.zeros((n_det,), dtype=np.float32)
+    else:
+        det_scores_f = np.asarray(det_scores, dtype=np.float32).reshape(-1)
+        if det_scores_f.shape[0] != n_det:
+            m = min(det_scores_f.shape[0], n_det)
+            tmp = np.zeros((n_det,), dtype=np.float32)
+            tmp[:m] = det_scores_f[:m]
+            det_scores_f = tmp
+
+    thr = float(thr_xy)
+    for cls in (set(det_labels.tolist()) | set(gt_labels.tolist())):
+        di = np.where(det_labels == int(cls))[0]
+        gi = np.where(gt_labels == int(cls))[0]
+        if di.size == 0 or gi.size == 0:
+            continue
+
+        dmat = _euclid2(det_xyz[di, :2], gt_xyz[gi, :2])
+        feasible = dmat <= thr
+        if not np.any(feasible):
+            continue
+
+        # candidate -> nearest feasible gt
+        for ii in range(dmat.shape[0]):
+            row = dmat[ii]
+            m = feasible[ii]
+            if not np.any(m):
+                continue
+            local_j = int(np.argmin(np.where(m, row, np.inf)))
+            d = float(row[local_j])
+            det_idx = int(di[ii])
+            gt_idx = int(gi[local_j])
+            cand_to_gt[det_idx] = gt_idx
+            cand_to_gt_dist[det_idx] = np.float32(d)
+            cand_cover_counts[det_idx] = int(np.count_nonzero(m))
+
+        # gt -> best candidate (nearest, tie-break by score desc)
+        for jj in range(dmat.shape[1]):
+            col = dmat[:, jj]
+            m = feasible[:, jj]
+            if not np.any(m):
+                continue
+            gt_candidate_counts[int(gi[jj])] = int(np.count_nonzero(m))
+            cand_local = np.nonzero(m)[0].astype(np.int64)
+            cand_dist = col[cand_local]
+            cand_score = det_scores_f[di[cand_local]]
+            order = np.lexsort((-cand_score, cand_dist))
+            best_local = int(cand_local[order[0]])
+            gt_best_cand[int(gi[jj])] = int(di[best_local])
+
+    return CandidateGtLinks(
+        cand_to_gt=cand_to_gt,
+        cand_to_gt_dist=cand_to_gt_dist,
+        gt_best_cand=gt_best_cand,
+        cand_cover_counts=cand_cover_counts,
+        gt_candidate_counts=gt_candidate_counts,
     )
 
 

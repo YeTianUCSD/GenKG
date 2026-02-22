@@ -13,8 +13,10 @@ eval_refined: true
 print_delta: true
 
 # comma-separated thresholds in meters
-match_thrs: "2.0"
+# include 2.5 to align with trainset match_thr and avoid single-threshold misread.
+match_thrs: "2.0,2.5"
 ignore_classes: "-1"
+decompose_keep_add: true
 
 # attr fields (optional)
 raw_attr_field: null

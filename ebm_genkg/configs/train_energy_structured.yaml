@@ -28,4 +28,20 @@ struct_margin: 1.0
 struct_frames_per_step: 4
 struct_max_cands_per_frame: 64
 pair_radius: 2.5
+pair_max_neighbors: 12
+pair_cache_max_frames: 512
 pair_energy_scale: 1.0
+
+# stage-2 aligned structured targets
+raw_pos_score_thr: 0.30
+neg_warp_gain_thr: 0.0
+neg_dup_thr: 0.55
+neg_score_thr: 0.35
+neg_reg_weight: 0.30
+pair_sup_weight: 0.20
+pair_conflict_overlap_thr: 0.55
+pair_conflict_close_thr: 0.60
+pair_conflict_dup_thr: 0.55
+pair_conflict_weight: 2.0
+target_recall: 0.75
+target_select_metric: precision
