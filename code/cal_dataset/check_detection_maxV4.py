@@ -23,11 +23,13 @@
 
 用法示例：
 
+/home/code/3Ddetection/IS-Fusion/GenKG/data/nusence_val/sorted_by_scene_ISFUSIONandGTattr_val.json
+
 python -u /home/code/3Ddetection/IS-Fusion/GenKG/code/cal_dataset/check_detection_maxV4.py \
-  --json /home/code/3Ddetection/IS-Fusion/GenKG/data/nusence_val/sorted_by_scene_ISFUSIONandGTattr_val.json \
+  --json /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/model/late_fusion/output/sorted_by_scene_ISFUSIONandGTattr_val_3_modality_merged.json \
   --match_thr 0.5 1 2 3 5 8 10 \
   --frame_radius 0 \
-  --max_per_frame 500 \
+  --max_per_frame 1000 \
   --ignore_classes -1
 """
 

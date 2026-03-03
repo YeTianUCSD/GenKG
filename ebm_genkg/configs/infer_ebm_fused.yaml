@@ -1,21 +1,24 @@
 # run with:
-# python scripts/run_infer.py --config configs/infer_ebm.yaml
+# python scripts/run_infer.py --config configs/infer_ebm_fused.yaml
+#
+# NOTE:
+# This config uses your fused V2 JSON as input.
 
-in_json: /home/code/3Ddetection/IS-Fusion/GenKG/code/model/dataset/sorted_by_scene_ISFUSIONandGTattr_val.json
-out_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/out_refined.json
+in_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/model/late_fusion/output/V2/sorted_by_scene_ISFUSIONandGTattr_val_3_modality_aligned_fused_candidates.json
+out_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/out_refined_fused.json
 
-# null = full dataset; set integer (e.g., 10) for quick debug
 limit_scenes: null
 log_every_scenes: 10
 require_gt: false
 
-# candidate building
-use_warp: true
+# Candidate generation:
+# fused det already contains merged candidates, avoid adding warp again at first.
+use_warp: false
 warp_radius: 2
 warp_topk: 200
 warp_decay: 0.9
-raw_score_min: 0.05
-max_per_frame: 180
+raw_score_min: 0.0
+max_per_frame: 260
 ignore_classes: "-1"
 
 # inference backend
@@ -26,7 +29,7 @@ nms_thr: 1.2
 topk: 260
 include_sources: true
 
-# ebm runtime kwargs (active in four_term mode)
+# ebm runtime kwargs (same baseline as infer_ebm.yaml)
 ebm_energy_mode: four_term
 ebm_energy_select_margin: 0.15
 ebm_energy_prob_gate: 0.0
@@ -55,8 +58,6 @@ ebm_context_min_density: 2
 ebm_context_shortfall_penalty: 0.03
 ebm_context_warp_only: true
 ebm_unary_use_learned: true
-# Do not hardcode old experiment ckpt here.
-# Use run_train.py (it injects current train ckpt), or pass --ebm_unary_ckpt_path explicitly.
 ebm_unary_ckpt_path: null
 ebm_use_learned_class: true
 ebm_learned_class_min_prob: 0.55
@@ -88,7 +89,6 @@ ebm_recall_backfill_min_class_conf: 0.80
 ebm_recall_backfill_min_support: 3
 ebm_auto_threshold_from_ckpt: false
 
-# two-stage fill (legacy path; currently disabled)
 two_stage: false
 seed_keep_thr: 0.25
 seed_sources: raw
@@ -98,7 +98,6 @@ dt_cell_size: 1.0
 min_dist_to_seed: 0.8
 max_fill: 320
 
-# writeback
 write_mode: add
 det_key: det
 refined_key: det_refined
@@ -106,3 +105,4 @@ write_fields: boxes_3d,labels_3d,scores_3d,attrs,sources
 indent: 2
 
 dump_repl_map: null
+

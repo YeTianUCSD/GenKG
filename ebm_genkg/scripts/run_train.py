@@ -3,7 +3,7 @@
 
 """
 One-command training pipeline:
-  build_trainset.py -> train_unary.py / train_energy.py / train_energy_structured.py
+  build_trainset.py -> train_unary.py / train_energy.py / train_energy_structured.py / train_neural_ebm.py
 and archive artifacts under experiments/<run_id>/.
 
 Artifacts per run:
@@ -187,8 +187,9 @@ def main() -> None:
                     help="Path to train config (yaml/json). Use with --train_mode unary|energy.")
     ap.add_argument("--train_unary_config", type=str, default=None,
                     help="Deprecated alias of --train_config. Kept for compatibility.")
-    ap.add_argument("--train_mode", type=str, default="energy", choices=["unary", "energy", "energy_structured"],
-                    help="Training mode. 'energy_structured' uses scripts/train_energy_structured.py.")
+    ap.add_argument("--train_mode", type=str, default="energy", choices=["unary", "energy", "energy_structured", "neural_energy"],
+                    help="Training mode. 'energy_structured' uses scripts/train_energy_structured.py; "
+                         "'neural_energy' uses scripts/train_neural_ebm.py.")
 
     ap.add_argument("--run_name", type=str, default=None,
                     help="Optional run folder name. Default: train_<timestamp>")
@@ -234,6 +235,11 @@ def main() -> None:
     # Backward-compatible config resolution
     if args.train_config is None and args.train_unary_config is None:
         raise ValueError("One of --train_config / --train_unary_config is required.")
+    if args.train_unary_config is not None and args.train_mode != "unary":
+        raise ValueError(
+            "--train_unary_config is only valid when --train_mode unary. "
+            "For energy/energy_structured/neural_energy, use --train_config."
+        )
     if args.train_config is not None and args.train_unary_config is not None:
         if os.path.abspath(args.train_config) != os.path.abspath(args.train_unary_config):
             raise ValueError("Both --train_config and --train_unary_config provided but differ.")
@@ -283,6 +289,8 @@ def main() -> None:
     unary_summary = os.path.join(metrics_dir, "train_unary.summary.json")
     energy_ckpt = os.path.join(ckpt_dir, "energy_logreg.json")
     energy_summary = os.path.join(metrics_dir, "train_energy.summary.json")
+    neural_ckpt = os.path.join(ckpt_dir, "neural_energy.json")
+    neural_summary = os.path.join(metrics_dir, "train_neural_ebm.summary.json")
     infer_summary = os.path.join(metrics_dir, "infer_summary.json")
     eval_summary = os.path.join(metrics_dir, "eval_summary.json")
     tune_summary = os.path.join(metrics_dir, "tune_infer.summary.json")
@@ -329,12 +337,18 @@ def main() -> None:
         train_summary = energy_summary
         train_log_name = "train_energy.log"
         train_stage_name = "train_energy"
-    else:
+    elif args.train_mode == "energy_structured":
         train_script = "train_energy_structured.py"
         train_ckpt = energy_ckpt
         train_summary = energy_summary
         train_log_name = "train_energy.log"
         train_stage_name = "train_energy_structured"
+    else:
+        train_script = "train_neural_ebm.py"
+        train_ckpt = neural_ckpt
+        train_summary = neural_summary
+        train_log_name = "train_neural_ebm.log"
+        train_stage_name = "train_neural_ebm"
     if build_rc == 0 and not args.skip_train:
         train_cmd: List[str] = [
             py,
@@ -533,6 +547,8 @@ def main() -> None:
             "unary_summary": unary_summary,
             "energy_ckpt": energy_ckpt,
             "energy_summary": energy_summary,
+            "neural_ckpt": neural_ckpt,
+            "neural_summary": neural_summary,
             "tune_summary": tune_summary,
             "tuned_infer_config": tuned_infer_cfg if args.auto_tune_infer else None,
             "synced_infer_config": infer_cfg_synced,

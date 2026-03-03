@@ -1,0 +1,50 @@
+# run with:
+# python scripts/train_neural_ebm.py --config configs/train_neural_ebm.yaml
+
+in_npz: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset.npz
+out_ckpt: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/neural_energy.json
+out_summary: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/checkpoints/neural_energy.summary.json
+
+# split
+val_ratio: 0.2
+seed: 42
+split_by: scene
+
+# training
+normalize: true
+device: cuda
+epochs: 6
+frame_batch_size: 24
+max_cands_per_frame: 196
+lr: 2.0e-4
+weight_decay: 1.0e-5
+
+# transformer unary
+# keep nhead dividing d_model
+d_model: 128
+nhead: 4
+num_layers: 2
+dim_ff: 256
+dropout: 0.10
+
+# pair MLP
+pair_hidden: 64
+pair_radius: 2.5
+pair_max_neighbors: 12
+
+# multitask losses
+lambda_pair: 0.25
+lambda_cls: 0.25
+lambda_attr: 0.10
+class_pos_only: true
+attr_pos_only: true
+
+# threshold select
+threshold_metric: f2
+threshold_grid: "0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60"
+# optional: pick by target recall then maximize precision/f1
+target_recall: 0.82
+target_select_metric: precision
+
+# optional quick debug cap
+max_train_rows: null

@@ -1,0 +1,36 @@
+# run with:
+# python scripts/build_trainset.py --config configs/trainset_fused.yaml
+#
+# NOTE:
+# This config points to your fused V2 JSON (val split path provided by you).
+# For strict train/val separation, replace `in_json` with a fused TRAIN split JSON.
+
+in_json: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/model/late_fusion/output/V2/sorted_by_scene_ISFUSIONandGTattr_val_3_modality_aligned_fused_candidates.json
+out_npz: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset_fused.npz
+out_meta: /home/code/3Ddetection/IS-Fusion/GenKG/ebm_genkg/experiments/tmp/trainset_fused.meta.json
+
+# null = full dataset; set integer for quick iteration
+limit_scenes: null
+require_gt: true
+max_rows: null
+max_pair_edges: null
+log_every_frames: 200
+
+# build targets from all candidates in fused det
+target_candidates: all
+match_thr: 2.5
+ignore_classes: "-1"
+
+# Candidate generation:
+# fused det already contains rich merged candidates, so disable extra temporal warp first.
+use_warp: false
+warp_radius: 2
+warp_topk: 200
+warp_decay: 0.9
+raw_score_min: 0.0
+max_per_frame: 260
+
+# feature engineering
+support_cell: 1.0
+keep_soft_tau: 1.0
+

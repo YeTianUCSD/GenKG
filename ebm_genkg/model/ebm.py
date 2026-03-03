@@ -33,10 +33,18 @@ Notes:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+try:
+    import torch
+    import torch.nn as nn
+except Exception:
+    torch = None
+    nn = None
+_NN_MODULE_BASE = nn.Module if nn is not None else object
 
 from data import Candidate, FrameData  # scripts add ebm_genkg/ to sys.path
 
@@ -312,7 +320,7 @@ def _source_group(c: Candidate) -> str:
     return "other"
 
 
-_UNARY_MODEL_CACHE: Dict[str, Optional["_UnaryLinearModel"]] = {}
+_UNARY_MODEL_CACHE: Dict[str, Optional[Any]] = {}
 _CONTEXT_FEATURE_NAMES: List[str] = [
     "context_self_prob",
     "context_nbr_prob_mean",
@@ -323,6 +331,297 @@ _CONTEXT_FEATURE_NAMES: List[str] = [
     "context_nbr_abs_dt_mean",
     "context_nbr_score_mean",
 ]
+
+
+class _NeuralEBMNet(_NN_MODULE_BASE):
+    def __init__(
+        self,
+        in_dim: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_ff: int,
+        dropout: float,
+        num_classes: int,
+        num_attrs: int,
+        pair_hidden: int,
+        pair_dim: int = 9,
+    ):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            activation="relu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.unary_head = nn.Linear(d_model, 1)
+        self.class_head = nn.Linear(d_model, num_classes) if num_classes > 0 else None
+        self.attr_head = nn.Linear(d_model, num_attrs) if num_attrs > 0 else None
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(pair_dim, pair_hidden),
+            nn.ReLU(),
+            nn.Linear(pair_hidden, 1),
+        )
+
+    def forward_unary(self, x: Any) -> Tuple[Any, Optional[Any], Optional[Any]]:
+        h = self.encoder(self.in_proj(x))
+        keep = self.unary_head(h).squeeze(-1)
+        cls = self.class_head(h) if self.class_head is not None else None
+        attr = self.attr_head(h) if self.attr_head is not None else None
+        return keep, cls, attr
+
+    def forward_pair(self, pair_feat: Any) -> Any:
+        return self.pair_mlp(pair_feat).squeeze(-1)
+
+
+class _UnaryNeuralEBMModel:
+    def __init__(self, ckpt: Dict[str, Any], ckpt_path: str):
+        if torch is None or nn is None:
+            raise RuntimeError("Neural EBM checkpoint requires torch runtime in inference environment.")
+        self.model_type = str(ckpt.get("model_type", ""))
+        if self.model_type != "neural_ebm_transformer":
+            raise ValueError(f"Unsupported neural unary model_type: {self.model_type}")
+        self.feature_names = [str(x) for x in ckpt.get("feature_names", [])]
+        self.normalize = bool(ckpt.get("normalize", True))
+        self.mu = np.asarray(ckpt.get("mu", []), dtype=np.float32).reshape(-1)
+        self.std = np.asarray(ckpt.get("std", []), dtype=np.float32).reshape(-1)
+        if len(self.feature_names) == 0:
+            raise ValueError("neural unary checkpoint has empty feature_names")
+        if self.normalize and (self.mu.shape[0] != len(self.feature_names) or self.std.shape[0] != len(self.feature_names)):
+            raise ValueError("neural unary checkpoint mu/std dim mismatch")
+
+        ch = ckpt.get("class_head", {}) if isinstance(ckpt.get("class_head", {}), dict) else {}
+        ah = ckpt.get("attr_head", {}) if isinstance(ckpt.get("attr_head", {}), dict) else {}
+        self.class_enabled = bool(ch.get("enabled", False))
+        self.attr_enabled = bool(ah.get("enabled", False))
+        self.class_labels = [int(x) for x in ch.get("class_labels", [])] if isinstance(ch.get("class_labels", []), list) else []
+        self.attr_names = [str(x) for x in ah.get("attr_names", [])] if isinstance(ah.get("attr_names", []), list) else []
+        attr_ids = [int(x) for x in ah.get("attr_ids", [])] if isinstance(ah.get("attr_ids", []), list) else []
+        if self.attr_enabled and len(self.attr_names) == 0 and len(attr_ids) > 0:
+            self.attr_names = [f"attr_{int(v)}" for v in attr_ids]
+
+        pair = ckpt.get("pair", {}) if isinstance(ckpt.get("pair", {}), dict) else {}
+        self.pair_enabled = bool(pair.get("enabled", True))
+        self.pair_feature_names = [str(x) for x in pair.get("feature_names", [])]
+        if len(self.pair_feature_names) == 0:
+            self.pair_feature_names = [
+                "same_label", "close", "overlap", "abs_dt_diff", "both_warp",
+                "either_warp", "score_min", "speed_diff", "same_dt",
+            ]
+        self.pair_scale = float(pair.get("scale", 1.0))
+        self.pair_radius = float(pair.get("radius", 2.5))
+
+        ne = ckpt.get("neural_ebm", {}) if isinstance(ckpt.get("neural_ebm", {}), dict) else {}
+        d_model = int(ne.get("d_model", 128))
+        nhead = int(ne.get("nhead", 4))
+        num_layers = int(ne.get("num_layers", 2))
+        dim_ff = int(ne.get("dim_ff", 256))
+        dropout = float(ne.get("dropout", 0.1))
+        pair_hidden = int(ne.get("pair_hidden", 64))
+        state_path = str(ne.get("torch_state_path", "")).strip()
+        if state_path == "":
+            raise ValueError("neural_ebm.torch_state_path missing in checkpoint")
+        if not os.path.isabs(state_path):
+            state_path = os.path.abspath(os.path.join(os.path.dirname(ckpt_path), state_path))
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(f"Neural EBM state file not found: {state_path}")
+
+        num_classes = int(len(self.class_labels)) if self.class_enabled else 0
+        num_attrs = int(len(self.attr_names)) if self.attr_enabled else 0
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = _NeuralEBMNet(
+            in_dim=int(len(self.feature_names)),
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_ff=dim_ff,
+            dropout=dropout,
+            num_classes=num_classes,
+            num_attrs=num_attrs,
+            pair_hidden=pair_hidden,
+            pair_dim=int(len(self.pair_feature_names)),
+        ).to(self.device)
+        state = torch.load(state_path, map_location=self.device)
+        self.net.load_state_dict(state, strict=True)
+        self.net.eval()
+
+    def _feature_dict(
+        self,
+        c: Candidate,
+        support_count: int,
+        support_unique_dt: int,
+        temporal_stability: float,
+        local_density: int,
+        support_score_mean: float = 0.0,
+        support_abs_dt_mean: float = 0.0,
+        support_raw_ratio: float = 0.0,
+        support_warp_ratio: float = 0.0,
+        temporal_local_interaction: float = 0.0,
+        support_density_interaction: float = 0.0,
+    ) -> Dict[str, float]:
+        b = np.asarray(c.box, dtype=np.float32)
+        if b.shape[0] < 9:
+            b = np.pad(b, (0, max(0, 9 - b.shape[0])), mode="constant")
+        score = float(getattr(c, "score", 0.0))
+        score = score if np.isfinite(score) else 0.0
+        label = float(int(getattr(c, "label", -1)))
+        dt = int(getattr(c, "from_dt", 0))
+        abs_dt = float(abs(dt))
+        speed = _cand_speed(c)
+        is_raw = 1.0 if _source_group(c) == "raw" else 0.0
+        is_warp = 1.0 if _source_group(c) == "warp" else 0.0
+        is_other = 1.0 - min(1.0, is_raw + is_warp)
+        x = float(b[0]) if np.isfinite(float(b[0])) else 0.0
+        y = float(b[1]) if np.isfinite(float(b[1])) else 0.0
+        z = float(b[2]) if np.isfinite(float(b[2])) else 0.0
+        dx = float(b[3]) if np.isfinite(float(b[3])) else 0.0
+        dy = float(b[4]) if np.isfinite(float(b[4])) else 0.0
+        dz = float(b[5]) if np.isfinite(float(b[5])) else 0.0
+        yaw = float(b[6]) if np.isfinite(float(b[6])) else 0.0
+        vx = float(b[7]) if np.isfinite(float(b[7])) else 0.0
+        vy = float(b[8]) if np.isfinite(float(b[8])) else 0.0
+        return {
+            "score": score, "label": label, "is_raw": is_raw, "is_warp": is_warp, "is_other": is_other,
+            "from_dt": float(dt), "abs_dt": abs_dt, "speed": float(speed),
+            "x": x, "y": y, "z": z, "dx": dx, "dy": dy, "dz": dz, "yaw": yaw, "vx": vx, "vy": vy,
+            "support_count": float(support_count), "support_unique_dt": float(support_unique_dt),
+            "temporal_stability": float(temporal_stability), "local_density": float(local_density),
+            "support_score_mean": float(support_score_mean), "support_abs_dt_mean": float(support_abs_dt_mean),
+            "support_raw_ratio": float(support_raw_ratio), "support_warp_ratio": float(support_warp_ratio),
+            "temporal_local_interaction": float(temporal_local_interaction),
+            "support_density_interaction": float(support_density_interaction),
+        }
+
+    def predict_all(
+        self,
+        cands: List[Candidate],
+        support_count_map: Dict[Tuple[int, int, int], int],
+        support_udt_map: Dict[Tuple[int, int, int], int],
+        local_density_map: Dict[Tuple[int, int], int],
+        cell_xy: float,
+    ) -> Dict[str, np.ndarray]:
+        n = len(cands)
+        if n <= 0:
+            return {"keep_logits": np.zeros((0,), dtype=np.float32), "class_logits": None, "attr_logits": None}
+        cs = float(max(cell_xy, 1e-6))
+        score_sum_map: Dict[Tuple[int, int, int], float] = {}
+        abs_dt_sum_map: Dict[Tuple[int, int, int], float] = {}
+        raw_count_map: Dict[Tuple[int, int, int], int] = {}
+        warp_count_map: Dict[Tuple[int, int, int], int] = {}
+        for c in cands:
+            x, y = _cand_xy(c)
+            gx = int(np.round(x / cs))
+            gy = int(np.round(y / cs))
+            key = (int(getattr(c, "label", -1)), gx, gy)
+            score_v = float(getattr(c, "score", 0.0))
+            score_v = score_v if np.isfinite(score_v) else 0.0
+            score_sum_map[key] = float(score_sum_map.get(key, 0.0) + score_v)
+            abs_dt_sum_map[key] = float(abs_dt_sum_map.get(key, 0.0) + float(abs(int(getattr(c, "from_dt", 0)))))
+            grp = _source_group(c)
+            if grp == "raw":
+                raw_count_map[key] = int(raw_count_map.get(key, 0) + 1)
+            elif grp == "warp":
+                warp_count_map[key] = int(warp_count_map.get(key, 0) + 1)
+
+        X = np.zeros((n, len(self.feature_names)), dtype=np.float32)
+        for i, c in enumerate(cands):
+            x, y = _cand_xy(c)
+            gx = int(np.round(x / cs))
+            gy = int(np.round(y / cs))
+            key = (int(getattr(c, "label", -1)), gx, gy)
+            support_count = int(support_count_map.get(key, 1))
+            support_udt = int(support_udt_map.get(key, 1))
+            temporal_stability = float(support_udt / max(1, support_count))
+            support_score_mean = float(score_sum_map.get(key, float(getattr(c, "score", 0.0))) / max(1, support_count))
+            support_abs_dt_mean = float(abs_dt_sum_map.get(key, float(abs(int(getattr(c, "from_dt", 0))))) / max(1, support_count))
+            support_raw_ratio = float(raw_count_map.get(key, 0) / max(1, support_count))
+            support_warp_ratio = float(warp_count_map.get(key, 0) / max(1, support_count))
+            ld = int(local_density_map.get((gx, gy), 1))
+            temporal_local_interaction = float(temporal_stability * np.log1p(max(0.0, float(ld) - 1.0)))
+            support_density_interaction = float(float(support_count) / max(1.0, float(ld)))
+            fd = self._feature_dict(
+                c,
+                support_count=support_count,
+                support_unique_dt=support_udt,
+                temporal_stability=temporal_stability,
+                local_density=ld,
+                support_score_mean=support_score_mean,
+                support_abs_dt_mean=support_abs_dt_mean,
+                support_raw_ratio=support_raw_ratio,
+                support_warp_ratio=support_warp_ratio,
+                temporal_local_interaction=temporal_local_interaction,
+                support_density_interaction=support_density_interaction,
+            )
+            X[i, :] = np.asarray([float(fd.get(nm, 0.0)) for nm in self.feature_names], dtype=np.float32)
+        if self.normalize:
+            den = np.where(np.abs(self.std) < 1e-8, 1.0, self.std)
+            X = (X - self.mu) / den
+
+        with torch.no_grad():
+            xt = torch.from_numpy(X).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+            keep_t, cls_t, attr_t = self.net.forward_unary(xt)
+            keep = keep_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            cls = cls_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False) if cls_t is not None else None
+            attr = attr_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False) if attr_t is not None else None
+        return {"keep_logits": keep, "class_logits": cls, "attr_logits": attr}
+
+    def predict_logits(
+        self,
+        cands: List[Candidate],
+        support_count_map: Dict[Tuple[int, int, int], int],
+        support_udt_map: Dict[Tuple[int, int, int], int],
+        local_density_map: Dict[Tuple[int, int], int],
+        cell_xy: float,
+    ) -> np.ndarray:
+        out = self.predict_all(
+            cands,
+            support_count_map=support_count_map,
+            support_udt_map=support_udt_map,
+            local_density_map=local_density_map,
+            cell_xy=cell_xy,
+        )
+        return np.asarray(out.get("keep_logits", np.zeros((len(cands),), dtype=np.float32)), dtype=np.float32)
+
+    def _pair_feature_dict(self, ci: Candidate, cj: Candidate) -> Dict[str, float]:
+        li = int(getattr(ci, "label", -1))
+        lj = int(getattr(cj, "label", -1))
+        d2 = _dist2_xy(_cand_xy(ci), _cand_xy(cj))
+        d = float(np.sqrt(max(d2, 0.0)))
+        rad = float(max(self.pair_radius, 1e-6))
+        close = float(np.exp(-d / rad))
+        ov = float(_bev_overlap_ratio_min(ci, cj))
+        dti = int(getattr(ci, "from_dt", 0))
+        dtj = int(getattr(cj, "from_dt", 0))
+        abi = abs(dti - dtj)
+        wi = 1.0 if _source_group(ci) == "warp" else 0.0
+        wj = 1.0 if _source_group(cj) == "warp" else 0.0
+        return {
+            "same_label": 1.0 if li == lj else 0.0,
+            "close": close,
+            "overlap": ov,
+            "abs_dt_diff": float(min(abi, 8)) / 8.0,
+            "both_warp": wi * wj,
+            "either_warp": 1.0 if (wi + wj) > 0.0 else 0.0,
+            "score_min": float(min(float(getattr(ci, "score", 0.0)), float(getattr(cj, "score", 0.0)))),
+            "speed_diff": float(min(abs(_cand_speed(ci) - _cand_speed(cj)), 10.0)) / 10.0,
+            "same_dt": 1.0 if dti == dtj else 0.0,
+        }
+
+    def learned_pair_energy(self, ci: Candidate, cj: Candidate) -> float:
+        if (not self.pair_enabled) or len(self.pair_feature_names) == 0:
+            return 0.0
+        fd = self._pair_feature_dict(ci, cj)
+        x = np.asarray([float(fd.get(n, 0.0)) for n in self.pair_feature_names], dtype=np.float32)
+        with torch.no_grad():
+            xt = torch.from_numpy(x).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+            logit = float(self.net.forward_pair(xt).reshape(-1)[0].detach().cpu().item())
+        p = float(_sigmoid(np.asarray([logit], dtype=np.float32))[0])
+        return float(self.pair_scale * (0.5 - p))
 
 
 class _UnaryLinearModel:
@@ -785,7 +1084,7 @@ class _UnaryLinearModel:
         return float(self.pair_scale * (0.5 - p))
 
 
-def _load_unary_model(path: Optional[str]) -> Optional[_UnaryLinearModel]:
+def _load_unary_model(path: Optional[str]) -> Optional[Any]:
     if path is None or str(path).strip() == "":
         return None
     p = str(path)
@@ -794,9 +1093,13 @@ def _load_unary_model(path: Optional[str]) -> Optional[_UnaryLinearModel]:
     try:
         with open(p, "r") as f:
             ckpt = json.load(f)
-        model = _UnaryLinearModel(ckpt)
+        model_type = str(ckpt.get("model_type", ""))
+        if model_type == "neural_ebm_transformer":
+            model = _UnaryNeuralEBMModel(ckpt, ckpt_path=p)
+        else:
+            model = _UnaryLinearModel(ckpt)
         _UNARY_MODEL_CACHE[p] = model
-        print(f"[EBM] loaded unary checkpoint: {p}")
+        print(f"[EBM] loaded unary checkpoint: {p} (model_type={model_type})")
         return model
     except Exception as e:
         print(f"[EBM] warning: failed to load unary checkpoint '{p}': {repr(e)}")
@@ -1035,7 +1338,7 @@ def pair_energy(
     ci: Candidate,
     cj: Candidate,
     cfg: EBMConfig,
-    unary_model: Optional[_UnaryLinearModel] = None,
+    unary_model: Optional[Any] = None,
 ) -> float:
     li = int(getattr(ci, "label", -1))
     lj = int(getattr(cj, "label", -1))
@@ -1168,7 +1471,7 @@ def _greedy_select(
     attr_energy_arr: np.ndarray,
     rel_energy_arr: np.ndarray,
     cfg: EBMConfig,
-    unary_model: Optional[_UnaryLinearModel] = None,
+    unary_model: Optional[Any] = None,
     *,
     prob_thr: float,
     already_selected: Optional[List[int]] = None,
@@ -1315,7 +1618,7 @@ def solve_candidates(
     cell_xy_feat = float(cfg.support_cell_xy if cfg.support_cell_xy > 0 else cfg.dt_cell_size)
     sup_count_map, sup_udt_map, local_density_map = _build_unary_support_xy_maps(cands, cell_xy=cell_xy_feat)
 
-    unary_model: Optional[_UnaryLinearModel] = None
+    unary_model: Optional[Any] = None
     if bool(cfg.unary_use_learned):
         unary_model = _load_unary_model(cfg.unary_ckpt_path)
 
@@ -1911,7 +2214,7 @@ def ebm_infer_candidates(cands: List[Candidate], cfg: EBMConfig) -> Dict[str, An
         support_vals = np.array([cell_support_value(c, cfg, cell_count, cell_dtset) for c in cands], dtype=np.int64)
         cell_xy_feat = float(cfg.support_cell_xy if cfg.support_cell_xy > 0 else cfg.dt_cell_size)
         sup_count_map, sup_udt_map, local_density_map = _build_unary_support_xy_maps(cands, cell_xy=cell_xy_feat)
-        unary_model: Optional[_UnaryLinearModel] = None
+        unary_model: Optional[Any] = None
         if bool(cfg.unary_use_learned):
             unary_model = _load_unary_model(cfg.unary_ckpt_path)
         if unary_model is not None:

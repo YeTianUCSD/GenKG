@@ -2,9 +2,15 @@ data/
 ebm_genkg/experiments/
 ebm_genkg/checkpoints/
 ebm_genkg/tmp/
+ebm_genkg/model/late_fusion/output
 code/model/output/
 code/model/log/
 code/model/dataset/
+fusion_3modality/cal_mAP/output
+fusion_3modality/cal_mAP/*.json
+fusion_3modality/IO/output
+fusion_3modality/filterbynumber/isfusion/*.json
+fusion_3modality/filterbynumber/single_version/*.json
 data/
 __pycache__/
 *.pyc
